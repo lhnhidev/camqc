@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import numpy as np
 import pytest
 
 pytest.importorskip("PySide6")
 
+from gui_support import png  # noqa: E402
 from PySide6.QtCore import Qt  # noqa: E402
 from PySide6.QtGui import QColor, QPixmap  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
@@ -27,7 +28,6 @@ from camqc.pipeline import (  # noqa: E402
     RunResult,
     parse_config,
 )
-from gui_support import png  # noqa: E402
 
 RECT = {"type": "rect", "x": 100, "y": 40, "w": 200, "h": 120}
 CIRCLE = {"type": "circle", "x": 700, "y": 240, "r": 100}
@@ -191,7 +191,7 @@ def test_overlay_shapes_selection_edge_cases(run: RunResult) -> None:
 class FakeCapture:
     """Stand-in for cv2.VideoCapture."""
 
-    instances: list[FakeCapture] = []
+    instances: ClassVar[list[FakeCapture]] = []
 
     def __init__(self, opened: bool = True, frames: list[np.ndarray | None] | None = None) -> None:
         self.opened, self.frames, self.reads, self.released = opened, list(frames or []), 0, False

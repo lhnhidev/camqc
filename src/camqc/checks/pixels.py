@@ -41,7 +41,7 @@ def defect_mask(gray: np.ndarray, mode: str, diff_threshold: float) -> np.ndarra
 def defect_centers(mask: np.ndarray) -> list[tuple[int, int]]:
     """Return one ``(x, y)`` per connected component of ``mask``, in raster order."""
     count, _, _, centroids = cv2.connectedComponentsWithStats(mask.astype(np.uint8), connectivity=8)
-    points = [(int(round(cx)), int(round(cy))) for cx, cy in centroids[1:count]]  # 0 is background
+    points = [(round(cx), round(cy)) for cx, cy in centroids[1:count]]  # 0 is background
     return sorted(points, key=lambda p: (p[1], p[0]))
 
 

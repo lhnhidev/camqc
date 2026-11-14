@@ -12,16 +12,16 @@ import pytest
 pytest.importorskip("PySide6")
 pytest.importorskip("matplotlib")
 
+from gui_support import wait_for  # noqa: E402
 from matplotlib.backends.backend_agg import FigureCanvasAgg  # noqa: E402
 from matplotlib.colors import to_hex  # noqa: E402
 from matplotlib.figure import Figure  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
+from seed_support import PASSING, add_run, seed  # noqa: E402
 
 from camqc import db  # noqa: E402
 from camqc.gui import stats_tab  # noqa: E402
 from camqc.gui.stats_tab import StatsTab  # noqa: E402
-from gui_support import wait_for  # noqa: E402
-from seed_support import PASSING, add_run, seed  # noqa: E402
 
 
 @pytest.fixture

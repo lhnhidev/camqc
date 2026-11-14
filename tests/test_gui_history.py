@@ -10,16 +10,16 @@ import pytest
 
 pytest.importorskip("PySide6")
 
+from gui_support import click, wait_for  # noqa: E402
 from PySide6.QtCore import QCoreApplication, QEvent, Qt  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
+from seed_support import PASSING, add_run, seed  # noqa: E402
 
 from camqc import db  # noqa: E402
 from camqc.gui import history_tab  # noqa: E402
 from camqc.gui.common import DateRangeBar  # noqa: E402
 from camqc.gui.history_tab import HistoryTab  # noqa: E402
-from gui_support import click, wait_for  # noqa: E402
-from seed_support import PASSING, add_run, seed  # noqa: E402
 
 
 @pytest.fixture

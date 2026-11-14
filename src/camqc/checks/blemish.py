@@ -59,8 +59,8 @@ def find_blobs(mask: np.ndarray, ratio: np.ndarray, min_area: int) -> list[dict[
         if area < min_area:
             continue
         blobs.append({
-            "x": int(round(centroids[i][0])),
-            "y": int(round(centroids[i][1])),
+            "x": round(centroids[i][0]),
+            "y": round(centroids[i][1]),
             "area": area,
             "contrast": float(1.0 - ratio_sums[i] / area),
         })
@@ -110,7 +110,7 @@ def run(image_bgr: np.ndarray, params: dict[str, Any]) -> CheckResult:
             "type": "circle",
             "x": b["x"],
             "y": b["y"],
-            "r": int(round(np.sqrt(b["area"] / np.pi))) + OVERLAY_PADDING,
+            "r": round(np.sqrt(b["area"] / np.pi)) + OVERLAY_PADDING,
         }
         for b in listed
     ]

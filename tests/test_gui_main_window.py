@@ -4,16 +4,16 @@ from __future__ import annotations
 
 import time
 import tomllib
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
-import cv2
 import numpy as np
 import pytest
 
 pytest.importorskip("PySide6")
 
+from gui_support import click, png, wait_for  # noqa: E402
 from PySide6.QtCore import QSize, Qt, QTimer  # noqa: E402
 from PySide6.QtGui import QPixmap  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
@@ -22,7 +22,6 @@ from PySide6.QtWidgets import QApplication, QFileDialog  # noqa: E402
 from camqc import db  # noqa: E402
 from camqc.gui import main_window, workers  # noqa: E402
 from camqc.gui.main_window import MainWindow, ScaledImageLabel  # noqa: E402
-from gui_support import click, png, wait_for  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 

@@ -7,7 +7,15 @@ from datetime import datetime
 
 from camqc import db
 from camqc.checks.base import make_result
-from camqc.pipeline import ERROR, FAIL, INCOMPLETE, PASS, SKIPPED, CheckOutcome, RunResult
+from camqc.pipeline import (
+    ERROR,
+    FAIL,
+    INCOMPLETE,
+    PASS,
+    SKIPPED,
+    CheckOutcome,
+    RunResult,
+)
 
 
 def outcome(name: str, status: str = PASS, value: float = 1.0) -> CheckOutcome:
