@@ -75,6 +75,9 @@ def run_args(frames: dict[str, Path], dark: str = "dark") -> list[str]:
             "--dark", str(frames[dark]), "--white", str(frames["white"])]
 
 
+# --- init-db ---------------------------------------------------------------------------
+
+
 def test_init_db(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     path = tmp_path / "new" / "camqc.db"
     assert cli.main(["init-db", "--db", str(path), "--log-file", str(tmp_path / "l.log")]) == 0
@@ -86,6 +89,9 @@ def test_default_log_file_is_logs_camqc_log(tmp_path: Path, monkeypatch: pytest.
     monkeypatch.chdir(tmp_path)
     assert cli.main(["init-db"]) == 0
     assert (tmp_path / "camqc.db").is_file() and (tmp_path / "logs" / "camqc.log").is_file()
+
+
+# --- run -------------------------------------------------------------------------------
 
 
 def test_run_pass(frames: dict[str, Path], env: list[str], tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -167,6 +173,9 @@ def test_load_image_handles_non_ascii_paths(tmp_path: Path) -> None:
     assert ok
     encoded.tofile(str(path))
     assert cli.load_image(path).shape == (60, 80, 3)
+
+
+# --- batch -----------------------------------------------------------------------------
 
 
 def test_batch_uses_filename_stem_as_serial(
@@ -252,8 +261,96 @@ def test_batch_frame_option_and_directory_errors(
     assert "directory not found" in capsys.readouterr().err
 
 
+# --- history / stats -------------------------------------------------------------------
+
+
+def test_history_shows_retests_newest_first(
+    tmp_path: Path, env: list[str], mini_config: list[str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    write_png(tmp_path / "bad.png", solid(20))
+    write_png(tmp_path / "good.png", solid(128))
+    base = ["run", "--serial", "SN7", *mini_config, *env]
+    assert cli.main([*base, "--normal", str(tmp_path / "bad.png")]) == 1
+    assert cli.main([*base, "--normal", str(tmp_path / "good.png")]) == 0
+    capsys.readouterr()
+    assert cli.main(["history", "--serial", "SN7", "--detail", *env]) == 0
+    out = capsys.readouterr().out
+    rows = [line for line in out.splitlines() if re.match(r"^\s*\d+\s+20\d\d-", line)]
+    assert [r.split()[4] for r in rows] == ["PASS", "FAIL"]  # newest first
+    assert "Run #2" in out and "Run #1" in out and "brightness" in out
+    assert cli.main(["history", "--serial", "NOPE", *env]) == 0
+    assert "No runs found for serial NOPE" in capsys.readouterr().out
+
+
+def seed_run(conn: object, serial: str, when: datetime, *failed: str) -> None:
+    def outcome(name: str, status: str) -> CheckOutcome:
+        res = make_result(name, 1.0, "u", 0.0, 10.0, {"reason": "too low"} if status == FAIL else {})
+        return CheckOutcome(name, status, res, None, "flat", 1.0)
+
+    outcomes = tuple(outcome(n, FAIL) for n in failed) or (outcome("brightness", PASS),)
+    result = RunResult(FAIL if failed else PASS, outcomes, tuple(failed), 10.0)
+    db.save_run(conn, db.RunInput(serial, "CAM_A", "ST1", when), result)  # type: ignore[arg-type]
+
+
+def test_stats_tables(tmp_path: Path, env: list[str], capsys: pytest.CaptureFixture[str]) -> None:
+    conn = db.init_db(tmp_path / "t.db")
+    seed_run(conn, "A", datetime(2026, 11, 14, 9))
+    seed_run(conn, "B", datetime(2026, 11, 14, 10), "sharpness", "blemish")
+    seed_run(conn, "C", datetime(2026, 11, 14, 11))
+    seed_run(conn, "D", datetime(2026, 11, 15, 9), "sharpness")
+    conn.close()
+    assert cli.main(["stats", "--from", "2026-11-01", "--to", "2026-11-30", *env]) == 0
+    out = capsys.readouterr().out
+    assert re.search(r"^2026-11-14\s+3\s+2\s+1\s+0\s+66\.7", out, re.M)
+    assert re.search(r"^2026-11-15\s+1\s+0\s+1\s+0\s+0\.0", out, re.M)
+    assert re.search(r"^sharpness\s+2\s+66\.7\s+66\.7", out, re.M)
+    assert re.search(r"^blemish\s+1\s+33\.3\s+100\.0", out, re.M)
+    assert cli.main(["stats", "--from", "2026-11-15", "--to", "2026-11-15", *env]) == 0
+    only_15 = capsys.readouterr().out
+    assert "2026-11-14" not in only_15 and "sharpness" in only_15
+    assert cli.main(["stats", "--from", "2027-01-01", *env]) == 0
+    assert "No runs in the selected range" in capsys.readouterr().out
+
+
+def test_read_only_commands_do_not_create_a_missing_database(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    missing = tmp_path / "typo.db"
+    log = ["--log-file", str(tmp_path / "l.log")]
+    for argv in (["history", "--serial", "S"], ["stats"]):
+        assert cli.main([*argv, "--db", str(missing), *log]) == 2
+        assert "database not found" in capsys.readouterr().err
+    assert not missing.exists()
+
+
 def test_format_table_with_no_rows() -> None:
     assert cli.format_table(["a", "bb"], []).splitlines() == ["a  bb", "-  --"]
+
+
+def test_stats_without_failures(tmp_path: Path, env: list[str], capsys: pytest.CaptureFixture[str]) -> None:
+    conn = db.init_db(tmp_path / "t.db")
+    seed_run(conn, "A", datetime(2026, 11, 14, 9))
+    conn.close()
+    assert cli.main(["stats", *env]) == 0
+    assert "No failures" in capsys.readouterr().out
+
+
+# --- usage errors and formatting ---------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [[], ["bogus"], ["run", "--model", "CAM_A"], ["stats", "--from", "2026-13-45"], ["stats", "--from", "yesterday"],
+     ["batch", "--model", "CAM_A"], ["run", "--model", "CAM_A", "--serial", "S", "--normal"]],
+)
+def test_usage_errors_exit_2(argv: list[str], capsys: pytest.CaptureFixture[str]) -> None:
+    assert cli.main(argv) == 2
+    assert capsys.readouterr().err  # argparse explains what is wrong
+
+
+def test_help_exits_0(capsys: pytest.CaptureFixture[str]) -> None:
+    assert cli.main(["--help"]) == 0
+    assert "init-db" in capsys.readouterr().out
 
 
 def test_format_table_alignment_is_unaffected_by_colors() -> None:
@@ -295,3 +392,18 @@ def test_format_limits(low: float | None, high: float | None, text: str) -> None
 
 def test_exit_code_mapping() -> None:
     assert [cli.exit_code_for(v) for v in ("PASS", "FAIL", "INCOMPLETE")] == [0, 1, 1]
+
+
+def test_module_entry_point_via_subprocess(tmp_path: Path) -> None:
+    env = {**os.environ, "PYTHONPATH": str(ROOT / "src"), "NO_COLOR": "1"}
+    common = ["--db", str(tmp_path / "s.db"), "--log-file", str(tmp_path / "s.log")]
+    init = subprocess.run([sys.executable, "-m", "camqc.cli", "init-db", *common],
+                          capture_output=True, text=True, cwd=tmp_path, env=env, timeout=120)
+    assert init.returncode == 0
+    stats = subprocess.run([sys.executable, "-m", "camqc.cli", "stats", *common],
+                           capture_output=True, text=True, cwd=tmp_path, env=env, timeout=120)
+    assert stats.returncode == 0 and "No runs in the selected range" in stats.stdout
+    bad = subprocess.run([sys.executable, "-m", "camqc.cli", "run", "--model", "CAM_A", "--serial", "S",
+                          "--normal", "missing.png", *common],
+                         capture_output=True, text=True, cwd=tmp_path, env=env, timeout=120)
+    assert bad.returncode == 2 and "image not found" in bad.stderr
