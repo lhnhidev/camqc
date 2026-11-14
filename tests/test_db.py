@@ -247,3 +247,40 @@ def test_pareto_respects_range_and_ignores_skipped_and_errors(seeded: sqlite3.Co
 def test_pareto_ties_are_ordered_by_name(conn: sqlite3.Connection) -> None:
     db.save_run(conn, run_input("T1", at(14)), run_result(FAIL, outcome("zeta", FAIL), outcome("alpha", FAIL)))
     assert [r["check_name"] for r in db.pareto_failures(conn, None, None)] == ["alpha", "zeta"]
+
+
+# --- search_runs ------------------------------------------------------------------------
+
+
+def serials(rows: list[dict]) -> list[str]:
+    return [r["serial"] for r in rows]
+
+
+def test_search_runs_substring_is_case_insensitive_and_newest_first(conn: sqlite3.Connection) -> None:
+    db.save_run(conn, run_input("SN-001", at(14, 8)), PASSING)
+    db.save_run(conn, run_input("sn-002", at(14, 9)), PASSING)
+    db.save_run(conn, run_input("XSN-003", at(14, 10)), PASSING)
+    db.save_run(conn, run_input("OTHER", at(14, 11)), PASSING)
+    assert serials(db.search_runs(conn, "sn")) == ["XSN-003", "sn-002", "SN-001"]
+    assert serials(db.search_runs(conn, "N-00")) == ["XSN-003", "sn-002", "SN-001"]
+    assert serials(db.search_runs(conn, "SN-001")) == ["SN-001"]
+    assert serials(db.search_runs(conn, "zzz")) == []
+    assert len(db.search_runs(conn, "")) == len(db.search_runs(conn, None)) == 4  # empty = no filter
+
+
+def test_search_runs_treats_wildcards_literally(conn: sqlite3.Connection) -> None:
+    for i, serial in enumerate(["A%B", "A_B", "AXB", "50!off", r"back\slash"]):
+        db.save_run(conn, run_input(serial, at(14, 8 + i)), PASSING)
+    assert serials(db.search_runs(conn, "%")) == ["A%B"]
+    assert serials(db.search_runs(conn, "_")) == ["A_B"]
+    assert serials(db.search_runs(conn, "A_B")) == ["A_B"]  # does not also match AXB
+    assert serials(db.search_runs(conn, "!")) == ["50!off"]
+    assert serials(db.search_runs(conn, "\\")) == [r"back\slash"]
+
+
+def test_search_runs_combines_filters_and_limit(seeded: sqlite3.Connection) -> None:
+    assert serials(db.search_runs(seeded, "B", "2026-11-14", "2026-11-15", FAIL)) == ["B1"]
+    assert serials(db.search_runs(seeded, None, "2026-11-15", "2026-11-15")) == ["B2", "B1"]
+    assert serials(db.search_runs(seeded, None, None, None, limit=2)) == ["C1", "B2"]
+    assert db.search_runs(seeded, "x'; DROP TABLE runs; --") == []
+    assert len(db.search_runs(seeded)) == 6  # the table is still there

@@ -240,6 +240,49 @@ def list_runs(
     return [dict(r) for r in rows]
 
 
+LIKE_ESCAPE = "!"
+
+
+def _like_pattern(text: str) -> str:
+    """Return a ``LIKE`` pattern matching ``text`` as a substring (``%`` and ``_`` are literal)."""
+    for char in (LIKE_ESCAPE, "%", "_"):
+        text = text.replace(char, LIKE_ESCAPE + char)
+    return f"%{text}%"
+
+
+def search_runs(
+    conn: sqlite3.Connection,
+    serial_contains: str | None = None,
+    date_from: DateLike = None,
+    date_to: DateLike = None,
+    verdict: str | None = None,
+    limit: int | None = None,
+) -> list[dict[str, Any]]:
+    """Return runs whose serial contains ``serial_contains``, newest first.
+
+    Args:
+        conn: Database connection.
+        serial_contains: Substring to look for in the serial (ASCII case-insensitive,
+            wildcards in the text are matched literally); ``None`` or ``""`` matches all.
+        date_from: First day, or ``None`` for no lower bound.
+        date_to: Last day (inclusive), or ``None`` for no upper bound.
+        verdict: If given, only runs with this verdict.
+        limit: Maximum number of rows, or ``None`` for all.
+    """
+    clause, params = _range_clause(date_from, date_to)
+    if serial_contains:
+        clause += f" AND runs.serial LIKE ? ESCAPE '{LIKE_ESCAPE}'"
+        params.append(_like_pattern(serial_contains))
+    if verdict is not None:
+        clause += " AND runs.verdict = ?"
+        params.append(verdict)
+    sql = "SELECT * FROM runs WHERE 1 = 1" + clause + " ORDER BY started_at DESC, id DESC"
+    if limit is not None:
+        sql += " LIMIT ?"
+        params.append(limit)
+    return [dict(r) for r in conn.execute(sql, params).fetchall()]
+
+
 def get_run_detail(conn: sqlite3.Connection, run_id: int) -> dict[str, Any] | None:
     """Return a run with its ``results`` list, or ``None`` if the id is unknown.
 
