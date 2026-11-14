@@ -49,6 +49,18 @@ def make_sample() -> Callable[[str], np.ndarray]:
 def qapp():  # noqa: ANN201 - yields a QApplication; PySide6 is imported lazily
     """The single QApplication for GUI tests (skips them if PySide6 is missing)."""
     pytest.importorskip("PySide6")
+    import gc
+
+    from PySide6.QtCore import QCoreApplication, QEvent
     from PySide6.QtWidgets import QApplication
 
-    yield QApplication.instance() or QApplication([])
+    app = QApplication.instance() or QApplication([])
+    yield app
+    # Destroy every widget while the QApplication is still alive; otherwise Qt can abort
+    # at interpreter exit when leftover widgets outlive the application object.
+    for widget in app.topLevelWidgets():
+        widget.close()
+        widget.deleteLater()
+    app.processEvents()
+    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete.value)
+    gc.collect()
