@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 from collections.abc import Callable
 from pathlib import Path
 from types import ModuleType
 
 import numpy as np
 import pytest
+
+# Run any Qt widget tests headless (must be set before PySide6 creates a QApplication).
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 TOOL_PATH = Path(__file__).resolve().parent.parent / "tools" / "gen_samples.py"
 
