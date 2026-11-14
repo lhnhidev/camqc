@@ -11,11 +11,14 @@ from typing import Any
 import cv2
 import numpy as np
 
-from camqc.checks.base import CheckResult, make_result, to_gray
-
-CENTER_FRACTION = 0.5
-CORNER_FRACTION = 0.2
-
+from camqc.checks.base import (
+    CheckResult,
+    center_region,
+    corner_regions,
+    crop,
+    make_result,
+    to_gray,
+)
 
 MIN_SIDE_PX = 10
 
@@ -23,29 +26,6 @@ MIN_SIDE_PX = 10
 def laplacian(gray: np.ndarray) -> np.ndarray:
     """Return the Laplacian of ``gray`` as float64."""
     return cv2.Laplacian(gray, cv2.CV_64F)
-
-
-def center_region(h: int, w: int, fraction: float = CENTER_FRACTION) -> tuple[int, int, int, int]:
-    """Return ``(x, y, w, h)`` of the centered region covering ``fraction`` of each side."""
-    rw, rh = int(w * fraction), int(h * fraction)
-    return (w - rw) // 2, (h - rh) // 2, rw, rh
-
-
-def corner_regions(h: int, w: int, fraction: float = CORNER_FRACTION) -> dict[str, tuple[int, int, int, int]]:
-    """Return ``(x, y, w, h)`` for the four corner regions, each ``fraction`` of a side."""
-    rw, rh = int(w * fraction), int(h * fraction)
-    return {
-        "top_left": (0, 0, rw, rh),
-        "top_right": (w - rw, 0, rw, rh),
-        "bottom_left": (0, h - rh, rw, rh),
-        "bottom_right": (w - rw, h - rh, rw, rh),
-    }
-
-
-def crop(img: np.ndarray, rect: tuple[int, int, int, int]) -> np.ndarray:
-    """Return the sub-image for an ``(x, y, w, h)`` rectangle."""
-    x, y, w, h = rect
-    return img[y : y + h, x : x + w]
 
 
 def run(image_bgr: np.ndarray, params: dict[str, Any]) -> CheckResult:

@@ -6,7 +6,7 @@ import cv2
 import numpy as np
 import pytest
 
-from camqc.checks import sharpness
+from camqc.checks import base, sharpness
 
 H, W = 200, 300
 
@@ -18,8 +18,8 @@ def checker(square: int = 10) -> np.ndarray:
 
 
 def test_regions_geometry() -> None:
-    assert sharpness.center_region(200, 300) == (75, 50, 150, 100)
-    corners = sharpness.corner_regions(200, 300)
+    assert base.center_region(200, 300) == (75, 50, 150, 100)
+    corners = base.corner_regions(200, 300)
     assert corners["top_left"] == (0, 0, 60, 40)
     assert corners["bottom_right"] == (240, 160, 60, 40)
     assert set(corners) == {"top_left", "top_right", "bottom_left", "bottom_right"}

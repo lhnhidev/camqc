@@ -47,6 +47,34 @@ def to_gray(image_bgr: np.ndarray) -> np.ndarray:
     return cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
 
 
+Rect = tuple[int, int, int, int]  # (x, y, w, h)
+
+
+def center_region(h: int, w: int, fraction: float = 0.5) -> Rect:
+    """Return ``(x, y, w, h)`` of the centered region covering ``fraction`` of each side."""
+    rw, rh = int(w * fraction), int(h * fraction)
+    return (w - rw) // 2, (h - rh) // 2, rw, rh
+
+
+def corner_regions(
+    h: int, w: int, fraction: float = 0.2
+) -> dict[str, Rect]:
+    """Return ``(x, y, w, h)`` for the four corner regions, each ``fraction`` of a side."""
+    rw, rh = int(w * fraction), int(h * fraction)
+    return {
+        "top_left": (0, 0, rw, rh),
+        "top_right": (w - rw, 0, rw, rh),
+        "bottom_left": (0, h - rh, rw, rh),
+        "bottom_right": (w - rw, h - rh, rw, rh),
+    }
+
+
+def crop(img: np.ndarray, rect: Rect) -> np.ndarray:
+    """Return the sub-image for an ``(x, y, w, h)`` rectangle."""
+    x, y, w, h = rect
+    return img[y : y + h, x : x + w]
+
+
 def in_range(value: float, low: float | None, high: float | None) -> bool:
     """Return True if ``low <= value <= high``; a ``None`` bound is unbounded."""
     return (low is None or value >= low) and (high is None or value <= high)
