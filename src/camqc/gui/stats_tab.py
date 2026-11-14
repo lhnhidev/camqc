@@ -192,3 +192,129 @@ def draw_charts(fig: Figure, days: Sequence[Mapping[str, Any]], pareto: Sequence
     top, bottom = fig.subplots(2, 1)
     plot_yield(top, days)
     plot_pareto(bottom, pareto)
+
+
+# --- the tab ---------------------------------------------------------------------------
+
+
+class StatsTab(LazyRefreshWidget):
+    """Yield per day and a Pareto of failing checks for a date range, with a table view."""
+
+    def __init__(self, db_path: str | Path, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._db_path = db_path
+        self.days: list[dict[str, Any]] = []
+        self.pareto: list[dict[str, Any]] = []
+        self._resize_timer = QTimer(self)
+        self._resize_timer.setSingleShot(True)
+        self._resize_timer.setInterval(RESIZE_REDRAW_MS)
+        self._resize_timer.timeout.connect(self._redraw)
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        """Create the filter bar, the canvas, the summary and the optional data tables."""
+        self.date_bar = DateRangeBar()
+        self.date_bar.changed.connect(self.refresh)
+        self.refresh_button = QPushButton("Refresh", objectName="stats_refresh_button")
+        self.refresh_button.clicked.connect(self.refresh)
+        self.summary_label = QLabel("", objectName="stats_summary_label")
+        bar = QHBoxLayout()
+        bar.addWidget(self.date_bar)
+        bar.addWidget(self.refresh_button)
+        bar.addWidget(self.summary_label, 1)
+
+        self.figure = Figure(figsize=(9, 7), facecolor=SURFACE)
+        self.canvas = FigureCanvasQTAgg(self.figure)
+        self.canvas.setMinimumHeight(360)
+
+        self.show_table = QCheckBox("Show data table", objectName="stats_table_check")
+        self.show_table.toggled.connect(self._on_table_toggled)
+        self.yield_table = self._make_table(("Day", "Runs", "Pass", "Fail", "Incomplete", "Yield %"), "yield_table")
+        self.pareto_table = self._make_table(("Check", "Failures", "% of failures", "Cumulative %"), "pareto_table")
+        self.tables = QWidget()
+        tables_layout = QHBoxLayout(self.tables)
+        tables_layout.setContentsMargins(0, 0, 0, 0)
+        tables_layout.addWidget(self.yield_table, 3)
+        tables_layout.addWidget(self.pareto_table, 2)
+        self.tables.setVisible(False)
+
+        self.message_label = QLabel("", objectName="stats_message_label", wordWrap=True)
+        self.message_label.setStyleSheet("color: #c00000;")
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(bar)
+        layout.addWidget(self.canvas, 1)
+        layout.addWidget(self.show_table)
+        layout.addWidget(self.tables)
+        layout.addWidget(self.message_label)
+
+    @staticmethod
+    def _make_table(headers: Sequence[str], name: str) -> QTableWidget:
+        table = QTableWidget(0, len(headers), objectName=name)
+        table.setHorizontalHeaderLabels(list(headers))
+        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        table.verticalHeader().setVisible(False)
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        table.horizontalHeader().setStretchLastSection(True)
+        table.setMaximumHeight(180)
+        return table
+
+    def _on_table_toggled(self, checked: bool) -> None:
+        self.tables.setVisible(checked)
+
+    # -- data --
+
+    def reload(self) -> None:
+        """Query yield and Pareto data for the selected dates and redraw everything."""
+        date_from, date_to = self.date_bar.date_range()
+        try:
+            conn = db.init_db(self._db_path)
+            try:
+                self.days = db.yield_by_day(conn, date_from, date_to)
+                self.pareto = db.pareto_failures(conn, date_from, date_to)
+            finally:
+                conn.close()
+        except (sqlite3.Error, OSError) as exc:
+            logger.exception("statistics query failed")
+            self.days, self.pareto = [], []
+            self.message_label.setText(f"Cannot read the database: {exc}")
+        else:
+            self.message_label.setText("")
+        self._update_summary()
+        self._fill_tables()
+        self._redraw()
+
+    def _update_summary(self) -> None:
+        """Show the overall run count and yield for the selected range."""
+        total = sum(d["total"] for d in self.days)
+        if total == 0:
+            self.summary_label.setText("No runs")
+            return
+        passed = sum(d["passed"] for d in self.days)
+        failures = sum(p["fail_count"] for p in self.pareto)
+        self.summary_label.setText(
+            f"{total} runs - overall yield {passed / total * 100:.1f}% - {failures} failing check results"
+        )
+
+    def _fill_tables(self) -> None:
+        """Fill the data tables (the same numbers as the charts, in text form)."""
+        def fill(table: QTableWidget, rows: Sequence[Sequence[Any]]) -> None:
+            table.setRowCount(len(rows))
+            for r, row in enumerate(rows):
+                for c, value in enumerate(row):
+                    table.setItem(r, c, QTableWidgetItem(str(value)))
+
+        fill(self.yield_table, [[d["day"], d["total"], d["passed"], d["failed"], d["incomplete"],
+                                 f"{d['yield_pct']:.1f}"] for d in self.days])
+        fill(self.pareto_table, [[p["check_name"], p["fail_count"], f"{p['pct']:.1f}",
+                                  f"{p['cumulative_pct']:.1f}"] for p in self.pareto])
+
+    def _redraw(self) -> None:
+        """Draw the charts for the current data at the current canvas size."""
+        draw_charts(self.figure, self.days, self.pareto)
+        self.canvas.draw_idle()
+
+    def resizeEvent(self, event: QResizeEvent) -> None:  # noqa: N802 - Qt override
+        """Redraw after a resize so bar thickness stays capped in pixels."""
+        super().resizeEvent(event)
+        self._resize_timer.start()

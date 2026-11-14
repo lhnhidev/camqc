@@ -19,6 +19,7 @@ from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from camqc import db  # noqa: E402
 from camqc.gui import stats_tab  # noqa: E402
+from camqc.gui.stats_tab import StatsTab  # noqa: E402
 from gui_support import wait_for  # noqa: E402
 from seed_support import PASSING, add_run, seed  # noqa: E402
 
@@ -74,6 +75,152 @@ def days(n: int, yields: Sequence[float] | None = None) -> list[dict[str, Any]]:
 def pareto(n: int) -> list[dict[str, Any]]:
     return [{"check_name": f"check_{i}", "fail_count": n - i, "pct": 100.0 / n, "cumulative_pct": 100.0 * (i + 1) / n}
             for i in range(n)]
+
+
+# --- the tab with data -------------------------------------------------------------------
+
+
+def test_first_show_loads_and_draws_both_charts(tab: StatsTab) -> None:
+    assert [d["day"] for d in tab.days] == ["2026-11-14", "2026-11-15", "2026-11-16"]
+    assert [(p["check_name"], p["fail_count"]) for p in tab.pareto] == [("sharpness", 2), ("blemish", 1)]
+    top, bottom = axes_of(tab)
+    assert bar_heights(top) == [66.7, 0.0, 100.0]  # yield % per day
+    assert bar_heights(bottom) == [66.7, 33.3]  # share of all check failures
+    assert [round(y, 1) for y in bottom.lines[0].get_ydata()] == [66.7, 100.0]  # cumulative share
+    assert top.get_title(loc="left") == "Yield by day" and bottom.get_title(loc="left") == "Pareto of failing checks"
+
+
+def test_there_is_no_second_y_axis(tab: StatsTab) -> None:
+    assert len(tab.figure.axes) == 2  # one axes per chart: no twinx
+    for ax in axes_of(tab):
+        assert ax.get_ylim() == (0, 112)  # both on the same 0-100 % scale (plus label headroom)
+        assert [t.get_text() for t in ax.get_yticklabels()] == ["0%", "25%", "50%", "75%", "100%"]
+
+
+def test_labels_are_selective_and_text_uses_ink_tokens(tab: StatsTab) -> None:
+    top, bottom = axes_of(tab)
+    assert texts(top) == ["67%", "0%", "100%"]
+    assert texts(bottom) == ["2", "1"]  # failure counts at the bar tips
+    assert {to_hex(t.get_color()) for t in top.texts + bottom.texts} == {stats_tab.INK_SECONDARY}
+    assert [t.get_text() for t in top.get_xticklabels()] == [
+        "2026-11-14\nn=3", "2026-11-15\nn=2", "2026-11-16\nn=1"]  # sample sizes ride on the tick labels
+
+
+def test_series_colors_and_legend_rules(tab: StatsTab) -> None:
+    top, bottom = axes_of(tab)
+    assert {to_hex(p.get_facecolor()) for p in top.patches} == {stats_tab.SERIES_BLUE}
+    assert top.get_legend() is None  # a single series needs no legend; the title names it
+    assert to_hex(bottom.lines[0].get_color()) == stats_tab.SERIES_ORANGE and bottom.lines[0].get_linewidth() == 2
+    legend = bottom.get_legend()  # two series: a legend is always present
+    assert legend is not None and len(legend.get_texts()) == 2
+    for ax in (top, bottom):
+        assert ax.yaxis.get_gridlines()[0].get_linestyle() == "-" and not ax.spines["top"].get_visible()
+
+
+def test_summary_and_data_tables(tab: StatsTab) -> None:
+    assert tab.summary_label.text() == "6 runs - overall yield 50.0% - 3 failing check results"
+    assert not tab.tables.isVisibleTo(tab)
+    tab.show_table.setChecked(True)
+    assert tab.tables.isVisibleTo(tab)
+    rows = [[tab.yield_table.item(r, c).text() for c in range(6)] for r in range(tab.yield_table.rowCount())]
+    assert rows == [["2026-11-14", "3", "2", "1", "0", "66.7"], ["2026-11-15", "2", "0", "1", "1", "0.0"],
+                    ["2026-11-16", "1", "1", "0", "0", "100.0"]]
+    prows = [[tab.pareto_table.item(r, c).text() for c in range(4)] for r in range(tab.pareto_table.rowCount())]
+    assert prows == [["sharpness", "2", "66.7", "66.7"], ["blemish", "1", "33.3", "100.0"]]
+    tab.show_table.setChecked(False)
+    assert not tab.tables.isVisibleTo(tab)
+
+
+def test_date_range_limits_both_charts(tab: StatsTab) -> None:
+    tab.date_bar.set_range(date(2026, 11, 15), date(2026, 11, 15))  # reloads by itself
+    top, bottom = axes_of(tab)
+    assert bar_heights(top) == [0.0] and bar_heights(bottom) == [100.0]
+    assert tab.summary_label.text() == "2 runs - overall yield 0.0% - 1 failing check results"
+    tab.date_bar.check.setChecked(False)
+    assert len(tab.days) == 3
+
+
+# --- empty and error states ----------------------------------------------------------------
+
+
+def test_empty_database_shows_placeholders_not_empty_axes(qapp: QApplication, tmp_path: Path) -> None:
+    widget = StatsTab(tmp_path / "empty.db")
+    widget.show()
+    top, bottom = axes_of(widget)
+    assert texts(top) == [stats_tab.NO_RUNS_TEXT] and texts(bottom) == [stats_tab.NO_FAILURES_TEXT]
+    assert len(top.patches) == 0 and len(bottom.patches) == 0 and top.get_xticks().size == 0
+    assert widget.summary_label.text() == "No runs" and widget.message_label.text() == ""
+    assert widget.yield_table.rowCount() == 0 and widget.pareto_table.rowCount() == 0
+    widget.close()
+
+
+def test_runs_without_failures_show_yield_and_a_good_news_placeholder(qapp: QApplication, tmp_path: Path) -> None:
+    conn = db.init_db(tmp_path / "ok.db")
+    add_run(conn, "P1", datetime(2026, 11, 14, 8), PASSING)
+    add_run(conn, "P2", datetime(2026, 11, 14, 9), PASSING)
+    conn.close()
+    widget = StatsTab(tmp_path / "ok.db")
+    widget.show()
+    top, bottom = axes_of(widget)
+    assert bar_heights(top) == [100.0] and texts(top) == ["100%"]
+    assert texts(bottom) == [stats_tab.NO_FAILURES_TEXT] and len(bottom.patches) == 0
+    assert widget.summary_label.text() == "2 runs - overall yield 100.0% - 0 failing check results"
+    widget.close()
+
+
+def test_range_with_no_runs_shows_placeholders(tab: StatsTab) -> None:
+    tab.date_bar.set_range(date(2027, 1, 1), date(2027, 1, 31))
+    top, bottom = axes_of(tab)
+    assert texts(top) == [stats_tab.NO_RUNS_TEXT] and texts(bottom) == [stats_tab.NO_FAILURES_TEXT]
+    assert tab.summary_label.text() == "No runs"
+
+
+def test_database_error_is_reported_and_charts_show_placeholders(qapp: QApplication, tmp_path: Path) -> None:
+    widget = StatsTab(tmp_path)  # a directory cannot be opened as a database
+    widget.show()
+    assert "Cannot read the database" in widget.message_label.text()
+    assert texts(axes_of(widget)[0]) == [stats_tab.NO_RUNS_TEXT]
+    widget.close()
+
+
+# --- refresh behaviour ---------------------------------------------------------------------
+
+
+def test_hidden_tab_is_lazy_and_loads_when_shown(qapp: QApplication, db_path: Path) -> None:
+    widget = StatsTab(db_path)
+    assert widget.is_stale and widget.days == []
+    widget.request_refresh()
+    assert widget.is_stale and widget.days == []
+    widget.show()
+    assert not widget.is_stale and len(widget.days) == 3
+    widget.close()
+
+
+def test_new_runs_refresh_a_visible_tab_once(tab: StatsTab, db_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[int] = []
+    real = tab.reload
+    monkeypatch.setattr(tab, "reload", lambda: (calls.append(1), real())[1])
+    conn = db.init_db(db_path)
+    for i in range(3):
+        add_run(conn, f"N{i}", datetime(2026, 11, 17, i), PASSING)
+        tab.request_refresh()
+    conn.close()
+    assert len(tab.days) == 3  # still the old data: the reload is delayed and coalesced
+    wait_for(lambda: len(tab.days) == 4)
+    assert len(calls) == 1 and tab.days[-1]["day"] == "2026-11-17" and tab.days[-1]["total"] == 3
+
+
+def test_resize_redraws_so_bar_thickness_stays_capped(tab: StatsTab, monkeypatch: pytest.MonkeyPatch) -> None:
+    redraws: list[int] = []
+    real = tab._redraw
+    monkeypatch.setattr(tab, "_redraw", lambda: (redraws.append(1), real())[1])
+    tab._resize_timer.timeout.disconnect()
+    tab._resize_timer.timeout.connect(tab._redraw)
+    tab.resize(700, 600)
+    wait_for(lambda: bool(redraws))
+
+
+# --- plotting functions without Qt ---------------------------------------------------------
 
 
 def test_bar_width_caps_thickness_at_24px() -> None:
