@@ -190,6 +190,50 @@ def test_choosing_a_new_frame_hides_old_overlays_but_the_table_still_reviews_the
     assert len(tab.viewer.shapes) == 5
 
 
+def test_webcam_capture_becomes_the_normal_frame(
+    window: MainWindow, paths: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shot = np.full((48, 64, 3), 90, np.uint8)
+    monkeypatch.setattr(workers, "capture_frame", lambda: (time.sleep(0.1), shot)[1])
+    tab = window.test_tab
+    click(tab.capture_button)
+    assert tab.is_running and not tab.capture_button.isEnabled() and not tab.run_button.isEnabled()
+    wait_for(lambda: tab.capture_button.isEnabled() and not tab.is_running)
+    assert tab.frame_labels["normal"].text().startswith("webcam ")
+    assert tab.frame_labels["normal"].toolTip() == "Captured from the webcam"
+    assert np.array_equal(tab._frames["normal"], shot)
+    assert "(64x48)" in tab.caption.text() and tab.run_button.isEnabled()
+    tab.model_combo.setCurrentText("M")  # the captured frame is usable like a file
+    tab.serial_edit.setText("CAMSHOT")
+    click(tab.run_button)
+    wait_for(lambda: tab.run_button.isEnabled())
+    assert runs(paths, "CAMSHOT")[0]["verdict"] == "FAIL"  # 90 is darker than mean_low 100
+
+
+def test_missing_camera_shows_a_friendly_error(window: MainWindow, monkeypatch: pytest.MonkeyPatch) -> None:
+    class NoCamera:
+        def __init__(self, index: int) -> None: ...
+        def isOpened(self) -> bool: return False  # noqa: N802, E704
+        def release(self) -> None: ...
+
+    monkeypatch.setattr(workers.cv2, "VideoCapture", NoCamera)  # the real capture_frame, no real camera
+    tab = window.test_tab
+    click(tab.capture_button)
+    wait_for(lambda: tab.capture_button.isEnabled() and not tab.is_running)
+    assert "No camera found" in tab.message_label.text()
+    assert "#c00000" in tab.message_label.styleSheet()  # shown as an error
+    assert "Traceback" not in tab.message_label.text() and "normal" not in tab._frames
+    assert tab.run_button.isEnabled()
+
+
+def test_unexpected_camera_failure_is_reported_not_raised(window: MainWindow, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(workers, "capture_frame", lambda: (_ for _ in ()).throw(RuntimeError("driver crashed")))
+    tab = window.test_tab
+    click(tab.capture_button)
+    wait_for(lambda: tab.capture_button.isEnabled() and not tab.is_running)
+    assert "Camera error: RuntimeError: driver crashed" in tab.message_label.text()
+
+
 def test_frame_buttons_are_disabled_while_a_job_runs(
     window: MainWindow, paths: dict[str, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -215,3 +259,160 @@ def test_clicking_a_skipped_row_keeps_the_caption_of_a_newly_chosen_frame(
     tab.set_frame("flat", paths["good"])  # not yet tested
     click_row(tab, row_of(tab, "pixels_dead"))
     assert "good.png" in tab.caption.text() and "nothing to draw" not in tab.caption.text()
+
+
+def test_ui_stays_responsive_during_a_slow_capture(window: MainWindow, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(workers, "capture_frame", lambda: (time.sleep(0.5), np.zeros((8, 8, 3), np.uint8))[1])
+    tab = window.test_tab
+    ticks: list[int] = []
+    timer = QTimer()
+    timer.timeout.connect(lambda: ticks.append(1))
+    timer.start(20)
+    click(tab.capture_button)
+    tab.capture_from_webcam()  # ignored while a capture is running
+    wait_for(lambda: tab.capture_button.isEnabled() and not tab.is_running)
+    timer.stop()
+    assert len(ticks) >= 8, f"event loop was blocked, only {len(ticks)} ticks"
+
+
+@pytest.fixture
+def folder(tmp_path: Path) -> Path:
+    root = tmp_path / "imgs"
+    root.mkdir()
+    png(root / "S001.png", 128)
+    png(root / "S002.png", 20)
+    (root / "bad.png").write_bytes(b"garbage")
+    png(root / "S003.png", 130)
+    (root / "notes.txt").write_text("ignored", encoding="utf-8")
+    return root
+
+
+def start_folder(win: MainWindow, folder: Path, monkeypatch: pytest.MonkeyPatch, model: str = "M") -> TestTab:
+    monkeypatch.setattr(QFileDialog, "getExistingDirectory", lambda *a, **k: str(folder))
+    tab = win.test_tab
+    tab.model_combo.setCurrentText(model)
+    click(tab.folder_button)
+    return tab
+
+
+def test_folder_mode_processes_every_image_with_a_progress_bar(
+    window: MainWindow, paths: dict[str, Path], folder: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tab = window.test_tab
+    assert not tab.progress_bar.isVisibleTo(tab) and not tab.cancel_button.isVisibleTo(tab)
+    tab = start_folder(window, folder, monkeypatch)
+    assert tab.is_running and not tab.run_button.isEnabled() and not tab.folder_button.isEnabled()
+    assert tab.progress_bar.isVisibleTo(tab) and tab.progress_bar.maximum() == 4
+    assert tab.cancel_button.isVisibleTo(tab)
+    wait_for(lambda: tab.folder_button.isEnabled() and not tab.is_running)
+
+    assert tab.progress_bar.value() == 4 and tab.progress_bar.maximum() == 4
+    assert not tab.cancel_button.isVisibleTo(tab)
+    assert "Folder done: 4 of 4 images - 2 PASS, 1 not PASS, 1 errors" in tab.message_label.text()
+    conn = db.init_db(paths["db"])
+    verdicts = {s: db.find_by_serial(conn, s)[0]["verdict"] for s in ("S001", "S002", "S003")}
+    assert verdicts == {"S001": "PASS", "S002": "FAIL", "S003": "PASS"}  # serial = file name stem
+    assert db.find_by_serial(conn, "bad") == [] and db.find_by_serial(conn, "notes") == []
+    conn.close()
+    assert tab.verdict_label.text() in {"PASS", "FAIL"} and tab.table.rowCount() == 1  # last result shown
+
+
+def test_folder_items_are_shown_with_their_overlays(
+    window: MainWindow, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "charts"
+    root.mkdir()
+    write(root / "U1.png", chart())
+    tab = start_folder(window, root, monkeypatch, model="O")  # sharpness draws 5 rects on the normal frame
+    wait_for(lambda: tab.folder_button.isEnabled() and not tab.is_running)
+    assert len(tab.viewer.shapes) == 5 and tab._viewer_frame == "normal"
+    click_row(tab, row_of(tab, "sharpness"))
+    assert {s.color for s in tab.viewer.shapes} == {viewer.HIGHLIGHT_COLOR}
+
+
+def test_folder_frame_type_comes_from_the_combo(
+    window: MainWindow, paths: dict[str, Path], folder: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tab = window.test_tab
+    tab.folder_frame_combo.setCurrentText("flat")  # config M needs a 'normal' frame -> INCOMPLETE
+    start_folder(window, folder, monkeypatch)
+    wait_for(lambda: tab.folder_button.isEnabled() and not tab.is_running)
+    assert runs(paths, "S001")[0]["verdict"] == "INCOMPLETE"
+
+
+def test_empty_or_missing_folder_does_not_start(window: MainWindow, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    (tmp_path / "empty").mkdir()
+    tab = start_folder(window, tmp_path / "empty", monkeypatch)
+    assert not tab.is_running and "no images found" in tab.message_label.text()
+    assert not tab.progress_bar.isVisibleTo(tab) and tab.folder_button.isEnabled()
+    monkeypatch.setattr(QFileDialog, "getExistingDirectory", lambda *a, **k: "")  # dialog cancelled
+    click(tab.folder_button)
+    assert not tab.is_running
+
+
+def test_running_a_unit_hides_the_folder_progress(
+    window: MainWindow, paths: dict[str, Path], folder: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tab = start_folder(window, folder, monkeypatch)
+    wait_for(lambda: tab.folder_button.isEnabled() and not tab.is_running)
+    assert tab.progress_bar.isVisibleTo(tab)
+    tab.set_frame("normal", paths["good"])
+    run_model(window, "M", "AFTER")
+    assert not tab.progress_bar.isVisibleTo(tab)
+
+
+@pytest.fixture
+def slow_folder(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    root = tmp_path / "many"
+    root.mkdir()
+    for i in range(10):
+        png(root / f"U{i:02d}.png", 128)
+    real = workers.run_pipeline
+    monkeypatch.setattr(workers, "run_pipeline", lambda *a: (time.sleep(0.15), real(*a))[1])
+    return root
+
+
+def test_cancel_stops_the_folder_batch_early(
+    window: MainWindow, paths: dict[str, Path], slow_folder: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tab = start_folder(window, slow_folder, monkeypatch)
+    wait_for(lambda: tab.progress_bar.value() >= 1)
+    click(tab.cancel_button)
+    assert not tab.cancel_button.isEnabled()
+    wait_for(lambda: tab.folder_button.isEnabled() and not tab.is_running)
+    saved = [s for i in range(10) if (s := runs(paths, f"U{i:02d}"))]
+    assert 1 <= len(saved) < 10
+    assert "Folder cancelled" in tab.message_label.text() and not tab.cancel_button.isVisibleTo(tab)
+    assert tab.progress_bar.value() < 10
+
+
+def test_run_and_capture_are_ignored_while_a_folder_runs(
+    window: MainWindow, slow_folder: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tab = start_folder(window, slow_folder, monkeypatch)
+    tab.serial_edit.setText("X")
+    tab.start_run()
+    tab.capture_from_webcam()
+    tab.start_folder(slow_folder)  # none of these may start a second job
+    assert tab._worker is not None and type(tab._worker).__name__ == "FolderWorker"
+    tab.cancel_folder()
+    wait_for(lambda: not tab.is_running)
+
+
+def test_closing_during_a_folder_batch_cancels_it_and_keeps_finished_runs(
+    qapp: QApplication, paths: dict[str, Path], slow_folder: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    win = MainWindow(paths["config"], paths["db"])
+    win.show()
+    tab = start_folder(win, slow_folder, monkeypatch)
+    wait_for(lambda: tab.progress_bar.value() >= 1)
+    assert win.close()  # cancels the batch, waits for the image in progress, delivers its result
+    assert not tab.is_running
+    saved = [s for i in range(10) if (s := runs(paths, f"U{i:02d}"))]
+    assert 1 <= len(saved) < 10
+
+
+def test_progress_bar_widget_text_format(window: MainWindow) -> None:
+    assert window.test_tab.progress_bar.format() == "%v / %m"
+    assert window.test_tab.folder_frame_combo.count() == 4
+    assert window.test_tab.capture_button.text() == "Capture from webcam"

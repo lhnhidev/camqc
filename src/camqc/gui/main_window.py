@@ -12,6 +12,7 @@ import logging
 import sqlite3
 import sys
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -30,6 +31,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
+    QProgressBar,
     QPushButton,
     QTableWidget,
     QTableWidgetItem,
@@ -45,12 +47,13 @@ from camqc.cli import (
     CliError,
     default_config_path,
     format_limits,
+    list_images,
     load_image,
     setup_logging,
     teardown_logging,
 )
 from camqc.gui.viewer import ScaledImageLabel, bgr_to_pixmap, overlay_shapes
-from camqc.gui.workers import PipelineWorker
+from camqc.gui.workers import CaptureWorker, FolderWorker, PipelineWorker
 from camqc.pipeline import (
     PASS,
     Config,
@@ -103,6 +106,18 @@ def result_rows(result: RunResult) -> list[tuple[list[str], str, str]]:
     return rows
 
 
+@dataclass
+class FolderRun:
+    """Settings and running totals of the folder batch in progress."""
+
+    model: str
+    station: str
+    total: int
+    passed: int = 0
+    not_passed: int = 0
+    errors: int = 0
+
+
 # --- Test tab --------------------------------------------------------------------------
 
 
@@ -127,6 +142,7 @@ class TestTab(QWidget):
         self._last_result: RunResult | None = None
         self._viewer_frame: str | None = None  # frame type shown in the viewer
         self._viewer_shows_review = False  # True if the viewer shows an image of the shown result
+        self._folder: FolderRun | None = None
         self._build_ui()
         if config_error:
             self.show_message(config_error, error=True)
@@ -161,6 +177,19 @@ class TestTab(QWidget):
             grid.addWidget(button, row, 0)
             grid.addWidget(label, row, 1)
             self.frame_buttons[frame], self.frame_labels[frame] = button, label
+        self.capture_button = QPushButton("Capture from webcam", objectName="capture_button")
+        self.capture_button.clicked.connect(self.capture_from_webcam)
+        grid.addWidget(self.capture_button, len(FRAME_BUTTON_ORDER), 0, 1, 2)
+        self.folder_button = QPushButton("Load folder...", objectName="folder_button")
+        self.folder_button.clicked.connect(self.choose_folder)
+        self.folder_frame_combo = QComboBox(objectName="folder_frame_combo")
+        self.folder_frame_combo.addItems(list(FRAME_BUTTON_ORDER))
+        self.folder_frame_combo.setToolTip("Frame type given to every image in the folder")
+        folder_row = QHBoxLayout()
+        folder_row.addWidget(QLabel("as frame:"))
+        folder_row.addWidget(self.folder_frame_combo, 1)
+        grid.addWidget(self.folder_button, len(FRAME_BUTTON_ORDER) + 1, 0)
+        grid.addLayout(folder_row, len(FRAME_BUTTON_ORDER) + 1, 1)
         grid.setColumnStretch(1, 1)
 
         self.run_button = QPushButton("Run", objectName="run_button")
@@ -194,6 +223,16 @@ class TestTab(QWidget):
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.itemSelectionChanged.connect(self._on_selection_changed)
 
+        self.progress_bar = QProgressBar(objectName="progress_bar")
+        self.progress_bar.setFormat("%v / %m")
+        self.cancel_button = QPushButton("Cancel", objectName="cancel_button")
+        self.cancel_button.clicked.connect(self.cancel_folder)
+        progress_row = QHBoxLayout()
+        progress_row.addWidget(self.progress_bar, 1)
+        progress_row.addWidget(self.cancel_button)
+        self.progress_bar.setVisible(False)
+        self.cancel_button.setVisible(False)
+
         self.message_label = QLabel("", objectName="message_label", wordWrap=True)
 
         left = QVBoxLayout()
@@ -202,6 +241,7 @@ class TestTab(QWidget):
         right = QVBoxLayout()
         right.addWidget(self.verdict_label)
         right.addWidget(self.table, 1)
+        right.addLayout(progress_row)
         right.addWidget(self.message_label)
         body = QHBoxLayout()
         body.addLayout(left, 1)
@@ -223,7 +263,7 @@ class TestTab(QWidget):
 
     @property
     def is_running(self) -> bool:
-        """True while a background job is active."""
+        """True while a background job (run, capture or folder batch) is active."""
         return self._thread is not None
 
     def show_message(self, text: str, error: bool = False) -> None:
@@ -239,13 +279,18 @@ class TestTab(QWidget):
         )
 
     def _set_busy(self, busy: bool) -> None:
-        """Enable or disable the Run and frame buttons while a job runs.
+        """Enable or disable the buttons that start jobs; show Cancel during folder batches.
 
         The frame buttons are disabled too: a frame chosen mid-run would never be tested.
         """
-        self.run_button.setEnabled(not busy and self._config is not None)
+        enabled = not busy and self._config is not None
+        for button in (self.run_button, self.capture_button, self.folder_button):
+            button.setEnabled(enabled)
         for button in self.frame_buttons.values():
             button.setEnabled(not busy)
+        folder_active = busy and isinstance(self._worker, FolderWorker)
+        self.cancel_button.setVisible(folder_active)
+        self.cancel_button.setEnabled(folder_active)
 
     def _launch(self, worker: QObject, *end_signals: SignalInstance) -> None:
         """Run ``worker`` in a new thread that quits when any of ``end_signals`` fires.
@@ -271,6 +316,7 @@ class TestTab(QWidget):
         if thread is not None:
             thread.deleteLater()
         self._pending = None
+        self._folder = None
         self._set_busy(False)
 
     # -- frames --
@@ -326,6 +372,31 @@ class TestTab(QWidget):
             label.setToolTip("")
             label.setStyleSheet("color: #808080;")
 
+    # -- webcam --
+
+    @Slot()
+    def capture_from_webcam(self) -> None:
+        """Grab one webcam frame (in a worker thread) and use it as the Normal frame."""
+        if self.is_running:
+            return
+        self.show_message("Capturing from webcam...")
+        worker = CaptureWorker()
+        worker.captured.connect(self._on_captured)
+        worker.failed.connect(self._on_capture_failed)
+        self._launch(worker, worker.captured, worker.failed)
+
+    @Slot(object)
+    def _on_captured(self, image: np.ndarray) -> None:
+        """Use the captured frame as the Normal frame."""
+        stamp = datetime.now().strftime("%H:%M:%S")
+        self._install_frame("normal", image, f"webcam {stamp}", "Captured from the webcam")
+        self.show_message("Captured a webcam frame as the Normal frame.")
+
+    @Slot(str)
+    def _on_capture_failed(self, message: str) -> None:
+        """Show the (already friendly) camera error."""
+        self.show_message(message, error=True)
+
     # -- running one unit --
 
     @Slot()
@@ -345,6 +416,7 @@ class TestTab(QWidget):
         station = self.station_edit.text().strip() or DEFAULT_STATION
         self._pending = (model, serial, station)
         self._run_pixmaps = dict(self._pixmaps)
+        self.progress_bar.setVisible(False)
         self.show_message(f"Running {model} on {serial}...")
         self._style_verdict("RUNNING")
 
@@ -386,6 +458,94 @@ class TestTab(QWidget):
         self._style_verdict("ERROR")
         self.table.setRowCount(0)
         self.show_message(f"Pipeline failed: {message}", error=True)
+
+    # -- folder mode --
+
+    @Slot()
+    def choose_folder(self) -> None:
+        """Ask for a folder and process every image in it."""
+        folder = QFileDialog.getExistingDirectory(self, "Choose folder of images", self._last_dir)
+        if folder:
+            self.start_folder(folder)
+
+    def start_folder(self, folder: str | Path) -> None:
+        """Process every image in ``folder`` as its own unit (serial = file name stem).
+
+        Each image is given the frame type chosen next to the *Load folder* button, runs
+        through the pipeline in a worker thread, and is saved as it completes.
+        """
+        if self.is_running or self._config is None:
+            return
+        try:
+            files = list_images(Path(folder))
+        except CliError as exc:
+            self.show_message(str(exc), error=True)
+            return
+        self._last_dir = str(folder)
+        model = self.model_combo.currentText()
+        station = self.station_edit.text().strip() or DEFAULT_STATION
+        self._folder = FolderRun(model, station, len(files))
+        self.progress_bar.setRange(0, len(files))
+        self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(True)
+        self.show_message(f"Processing {len(files)} images from {folder}...")
+
+        worker = FolderWorker(files, model, self.folder_frame_combo.currentText(), self._config)
+        worker.progress.connect(self._on_folder_progress)
+        worker.item_done.connect(self._on_folder_item)
+        worker.item_failed.connect(self._on_folder_item_failed)
+        worker.finished.connect(self._on_folder_finished)
+        self._launch(worker, worker.finished)
+
+    @Slot(int, int)
+    def _on_folder_progress(self, done: int, total: int) -> None:
+        """Advance the progress bar."""
+        self.progress_bar.setMaximum(total)
+        self.progress_bar.setValue(done)
+
+    @Slot(str, object, object)
+    def _on_folder_item(self, name: str, result: RunResult, frames: Mapping[str, np.ndarray]) -> None:
+        """Save one processed image and show its result."""
+        folder = self._folder
+        if folder is None:
+            return
+        pixmaps = {frame: bgr_to_pixmap(image) for frame, image in frames.items()}
+        self._show_run(result, pixmaps)
+        run_id = self._save_run(folder.model, Path(name).stem, folder.station, result)
+        if run_id is None:
+            folder.errors += 1
+            return
+        if result.verdict == PASS:
+            folder.passed += 1
+        else:
+            folder.not_passed += 1
+        self.show_message(f"{name}: {result.verdict} (run #{run_id})")
+
+    @Slot(str, str)
+    def _on_folder_item_failed(self, name: str, message: str) -> None:
+        """Count and show an image that could not be processed."""
+        if self._folder is not None:
+            self._folder.errors += 1
+        self.show_message(f"{name}: {message}", error=True)
+
+    @Slot(bool)
+    def _on_folder_finished(self, cancelled: bool) -> None:
+        """Summarize the batch."""
+        folder = self._folder
+        if folder is None:
+            return
+        done = folder.passed + folder.not_passed + folder.errors
+        text = (f"Folder {'cancelled' if cancelled else 'done'}: {done} of {folder.total} images - "
+                f"{folder.passed} PASS, {folder.not_passed} not PASS, {folder.errors} errors")
+        self.show_message(text, error=folder.errors > 0)
+
+    @Slot()
+    def cancel_folder(self) -> None:
+        """Stop the folder batch after the image being processed."""
+        if isinstance(self._worker, FolderWorker):
+            self._worker.cancel()
+            self.cancel_button.setEnabled(False)
+            self.show_message("Cancelling after the current image...")
 
     # -- results and overlays --
 
@@ -453,12 +613,16 @@ class TestTab(QWidget):
     def shutdown(self) -> bool:
         """Wait for a running job and deliver its queued results (so the run is saved).
 
+        A folder batch is cancelled first (it stops after the current image).
+
         Returns:
             True if no job is running any more; False if it did not finish within
             ``SHUTDOWN_WAIT_MS`` (the thread must then be kept alive, so do not close).
         """
         if self._thread is None:
             return True
+        if isinstance(self._worker, FolderWorker):
+            self._worker.cancel()
         self._thread.quit()
         if not self._thread.wait(SHUTDOWN_WAIT_MS):
             logger.warning("job still running after %d ms; not closing", SHUTDOWN_WAIT_MS)
