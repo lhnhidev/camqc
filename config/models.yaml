@@ -1,10 +1,81 @@
-# Per camera-model check thresholds.
-# Structure (to be finalized when checks are implemented):
+# Per camera-model check configuration.
 #
 # models:
-#   <model_name>:
+#   <MODEL_NAME>:
+#     description: free text (optional)
 #     checks:
-#       <check_name>:
-#         enabled: true
-#         <threshold_param>: <value>
-models: {}
+#       <check_key>:            # unique name of this check instance in the report
+#         check: <module>       # brightness | sharpness | pixels | shading | color | noise | blemish
+#                               #   (optional; defaults to <check_key>)
+#         enabled: true         # optional, default true
+#         frame: <type>         # REQUIRED: input frame type, or a list tried in order:
+#                               #   normal | flat | dark | white
+#         params: {...}         # passed to the check's run(); see each checks/*.py
+#
+# Frame types: "normal" = ordinary scene or test chart, "flat" = uniformly lit gray
+# target, "dark" = lens covered (hot pixels), "white" = bright flat target (dead pixels).
+# If a required frame is not supplied the check is SKIPPED and the run is INCOMPLETE.
+# Tuned for the synthetic images from tools/gen_samples.py.
+
+models:
+  CAM_A:
+    description: Standard module
+    checks:
+      brightness:
+        frame: [normal, flat]
+        params: {mean_low: 100, mean_high: 160, max_clipped_pct: 1.0}
+      sharpness:
+        frame: normal                 # needs a chart with edges
+        params: {min_center: 100}
+      pixels_hot:
+        check: pixels
+        frame: dark
+        params: {mode: hot, diff_threshold: 50, max_defects: 5}
+      pixels_dead:
+        check: pixels
+        frame: white
+        params: {mode: dead, diff_threshold: 50, max_defects: 5}
+      shading:
+        frame: flat
+        params: {min_corner_pct: 80}
+      color:
+        frame: flat
+        params: {ratio_low: 0.90, ratio_high: 1.10, max_delta_e: 10}
+      noise:
+        enabled: false                # noise check is not implemented yet
+        frame: flat
+        params: {}
+      blemish:
+        frame: flat
+        params: {contrast: 0.05, min_area: 30, max_blobs: 2}
+
+  CAM_B:
+    description: Premium module - stricter sharpness and blemish limits
+    checks:
+      brightness:
+        frame: [normal, flat]
+        params: {mean_low: 100, mean_high: 160, max_clipped_pct: 1.0}
+      sharpness:
+        frame: normal
+        params: {min_center: 500}
+      pixels_hot:
+        check: pixels
+        frame: dark
+        params: {mode: hot, diff_threshold: 50, max_defects: 5}
+      pixels_dead:
+        check: pixels
+        frame: white
+        params: {mode: dead, diff_threshold: 50, max_defects: 5}
+      shading:
+        frame: flat
+        params: {min_corner_pct: 80}
+      color:
+        frame: flat
+        params: {ratio_low: 0.90, ratio_high: 1.10, max_delta_e: 10}
+      noise:
+        enabled: false
+        frame: flat
+        params: {}
+      blemish:
+        frame: flat
+        params: {contrast: 0.04, min_area: 20, max_blobs: 0}
