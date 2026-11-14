@@ -49,6 +49,9 @@ def serials(widget: HistoryTab) -> list[str]:
     return displayed(widget, 2)
 
 
+# --- loading and filtering ---------------------------------------------------------------
+
+
 def test_first_show_loads_runs_newest_first(tab: HistoryTab) -> None:
     assert serials(tab) == ["C1", "B2", "B1", "A3", "A2", "A1"]
     assert displayed(tab, 0) == ["6", "5", "4", "3", "2", "1"]
@@ -138,6 +141,9 @@ def test_sorting_by_run_id_is_numeric_not_alphabetical(qapp: QApplication, tmp_p
     widget.close()
 
 
+# --- empty and error states ----------------------------------------------------------------
+
+
 def test_empty_database_shows_a_friendly_message(qapp: QApplication, tmp_path: Path) -> None:
     widget = HistoryTab(tmp_path / "empty.db")
     widget.show()
@@ -175,6 +181,61 @@ def test_results_are_truncated_with_a_notice(tab: HistoryTab, monkeypatch: pytes
     assert tab.count_label.text() == "6 runs"
 
 
+# --- details dialog ----------------------------------------------------------------------
+
+
+def test_double_click_opens_the_runs_check_results(tab: HistoryTab) -> None:
+    pos = tab.table.visualRect(tab.proxy.index(0, 2)).center()  # newest run: C1
+    viewport = tab.table.viewport()
+    QTest.mouseClick(viewport, Qt.MouseButton.LeftButton, pos=pos)  # a real double-click starts with a click
+    QTest.mouseDClick(viewport, Qt.MouseButton.LeftButton, pos=pos)
+    dialog = tab.detail_dialog
+    assert dialog is not None and dialog.isVisible()
+    assert dialog.windowTitle() == "Run #6 - C1"
+    header = dialog.header.text()
+    assert "C1" in header and "CAM_A" in header and "ST1" in header and "PASS" in header
+    table = dialog.table
+    assert [table.horizontalHeaderItem(c).text() for c in range(6)] == [
+        "Check", "Value", "Unit", "Limits", "Status", "Note"]
+    assert [[table.item(r, c).text() for c in range(5)] for r in range(table.rowCount())] == [
+        ["brightness", "1", "u", "0 .. 10", "PASS"], ["sharpness", "1", "u", "0 .. 10", "PASS"]]
+    assert table.item(0, 0).background().color().name() == "#c6efce"
+    dialog.close()
+
+
+def test_detail_shows_failures_skips_and_notes(tab: HistoryTab) -> None:
+    fail = tab.open_run_detail(5 - 1)  # run #4 = B1 (sharpness failed)
+    assert fail is not None
+    rows = {fail.table.item(r, 0).text(): r for r in range(fail.table.rowCount())}
+    r = rows["sharpness"]
+    assert fail.table.item(r, 4).text() == "FAIL" and fail.table.item(r, 5).text() == "sharpness out of range"
+    assert fail.table.item(r, 0).background().color().name() == "#ffc7ce"
+    fail.close()
+    skipped = tab.open_run_detail(5)  # run #5 = B2 (pixels_dead skipped)
+    assert skipped is not None
+    row = [skipped.table.item(1, c).text() for c in range(6)]
+    assert row == ["pixels_dead", "-", "-", "-", "SKIPPED", "required frame missing"]
+    assert skipped.table.item(1, 0).background().color().name() == "#ffeb9c"
+    assert "INCOMPLETE" in skipped.header.text()
+    skipped.close()
+
+
+def test_unknown_run_id_is_reported(tab: HistoryTab) -> None:
+    assert tab.open_run_detail(999) is None
+    assert "Run #999 no longer exists" in tab.message_label.text()
+
+
+def test_closed_dialog_is_forgotten(tab: HistoryTab) -> None:
+    dialog = tab.open_run_detail(1)
+    assert dialog is not None and tab.detail_dialog is dialog
+    dialog.close()
+    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete.value)  # WA_DeleteOnClose
+    assert tab.detail_dialog is None
+
+
+# --- lazy refresh ---------------------------------------------------------------------------
+
+
 def test_hidden_tab_does_not_query_until_shown(qapp: QApplication, db_path: Path) -> None:
     widget = HistoryTab(db_path)
     assert widget.is_stale and widget.proxy.rowCount() == 0  # nothing loaded while hidden
@@ -201,6 +262,9 @@ def test_visible_tab_refreshes_after_new_data_with_one_coalesced_reload(
     assert len(calls) == 1 and serials(tab)[0] == "N2"
 
 
+# --- the date bar ---------------------------------------------------------------------------
+
+
 def test_date_range_bar(qapp: QApplication) -> None:
     bar = DateRangeBar()
     changes: list[int] = []
@@ -217,6 +281,28 @@ def test_date_range_bar(qapp: QApplication) -> None:
     assert len(changes) == count + 1 and bar.date_range()[1] == date(2026, 3, 5)
     bar.check.setChecked(False)
     assert bar.date_range() == (None, None) and not bar.from_edit.isEnabled()
+
+
+def test_dialog_header_shows_free_text_literally(qapp: QApplication, tmp_path: Path) -> None:
+    conn = db.init_db(tmp_path / "x.db")
+    run_id = add_run(conn, "<SN-1> & <b>co</b>", datetime(2026, 11, 14, 8), PASSING, model="M<1>", station="S&T")
+    conn.close()
+    widget = HistoryTab(tmp_path / "x.db")
+    widget.show()
+    dialog = widget.open_run_detail(run_id)
+    assert dialog is not None
+    assert "&lt;SN-1&gt; &amp; &lt;b&gt;co&lt;/b&gt;" in dialog.header.text()
+    assert "M&lt;1&gt;" in dialog.header.text() and "S&amp;T" in dialog.header.text()
+    assert "<SN-1>" not in dialog.header.text()
+    dialog.close()
+    widget.close()
+
+
+def test_opening_a_run_clears_an_earlier_error(tab: HistoryTab) -> None:
+    assert tab.open_run_detail(999) is None and tab.message_label.text()
+    dialog = tab.open_run_detail(1)
+    assert dialog is not None and tab.message_label.text() == ""
+    dialog.close()
 
 
 def test_reversed_dates_are_swapped_not_silently_empty(tab: HistoryTab) -> None:
