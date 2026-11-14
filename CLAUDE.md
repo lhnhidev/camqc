@@ -36,6 +36,9 @@ Python 3.11+, OpenCV, NumPy, PySide6, SQLite (`sqlite3`), PyYAML, pytest, matplo
 pip install -e ".[dev]"     # install with dev deps
 pytest -q                   # run tests
 camqc --help                # CLI (or: python -m camqc.cli --help)
+camqc-gui                   # desktop app
+camqc report --run-id 12 --out report.html   # self-contained HTML report of one run
+camqc report --from 2026-11-01 --to 2026-11-30 --out runs.csv   # CSV of runs and checks
 ```
 
 ## Rules
