@@ -1,7 +1,8 @@
 """Main window: image source selection, live preview, run checks, and per-check PASS/FAIL display.
 
-A ``QMainWindow`` with three tabs: *Test* (this module), and *History* / *Statistics*
-placeholders. Anything slow (pipeline, webcam capture, folder batches) runs in a ``QThread``
+A ``QMainWindow`` with three tabs: *Test* (this module), *History* and *Statistics* (see
+:mod:`camqc.gui.history_tab` and :mod:`camqc.gui.stats_tab`), which refresh when a run is
+saved. Anything slow (pipeline, webcam capture, folder batches) runs in a ``QThread``
 worker (see :mod:`camqc.gui.workers`) so the UI never freezes; runs are saved to SQLite on the
 GUI thread because sqlite3 connections must not cross threads.
 """
@@ -17,7 +18,7 @@ from datetime import datetime
 from pathlib import Path
 
 import numpy as np
-from PySide6.QtCore import QCoreApplication, QObject, Qt, QThread, SignalInstance, Slot
+from PySide6.QtCore import QCoreApplication, QObject, Qt, QThread, Signal, SignalInstance, Slot
 from PySide6.QtGui import QBrush, QCloseEvent, QColor, QFont, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -52,6 +53,9 @@ from camqc.cli import (
     setup_logging,
     teardown_logging,
 )
+from camqc.gui.common import NEUTRAL_COLORS, colors_for  # noqa: F401 - re-exported
+from camqc.gui.history_tab import HistoryTab
+from camqc.gui.stats_tab import StatsTab
 from camqc.gui.viewer import ScaledImageLabel, bgr_to_pixmap, overlay_shapes
 from camqc.gui.workers import CaptureWorker, FolderWorker, PipelineWorker
 from camqc.pipeline import (
@@ -68,25 +72,11 @@ IMAGE_FILTER = "Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff);;All files (*)"
 DEFAULT_STATION = "UNKNOWN"
 FRAME_BUTTON_ORDER = ("normal", "dark", "white", "flat")  # flat last: only some checks need it
 
-GREEN, RED, AMBER, GRAY = "#c6efce", "#ffc7ce", "#ffeb9c", "#e0e0e0"
-STATUS_COLORS: Mapping[str, tuple[str, str]] = {  # status -> (background, text)
-    "PASS": (GREEN, "#006100"),
-    "FAIL": (RED, "#9c0006"),
-    "INCOMPLETE": (AMBER, "#9c5700"),
-    "SKIPPED": (AMBER, "#9c5700"),
-    "ERROR": (RED, "#9c0006"),
-}
-NEUTRAL_COLORS = (GRAY, "#404040")
 SHUTDOWN_WAIT_MS = 30_000  # how long closing the window waits for a running job
 TABLE_HEADERS = ("Check", "Value", "Unit", "Limits", "Status")
 
 
 # --- helpers ---------------------------------------------------------------------------
-
-
-def colors_for(status: str) -> tuple[str, str]:
-    """Return ``(background, text)`` colors for a status or verdict word."""
-    return STATUS_COLORS.get(status, NEUTRAL_COLORS)
 
 
 def result_rows(result: RunResult) -> list[tuple[list[str], str, str]]:
@@ -125,6 +115,8 @@ class TestTab(QWidget):
     """The *Test* tab: choose model/serial/frames, run, and see per-check results with overlays."""
 
     __test__ = False  # not a pytest test class despite the name
+
+    run_saved = Signal(int)  # emitted with the new run id after each run is stored
 
     def __init__(self, config: Config | None, db_path: str | Path, config_error: str = "") -> None:
         super().__init__()
@@ -437,6 +429,7 @@ class TestTab(QWidget):
             logger.exception("could not save run")
             self.show_message(f"Result NOT saved: {exc}", error=True)
             return None
+        self.run_saved.emit(run_id)
         return run_id
 
     @Slot(object)
@@ -649,18 +642,16 @@ class MainWindow(QMainWindow):
             logger.error("%s", exc)
             error = f"Configuration error: {exc}"
         self.test_tab = TestTab(config, db_path, error)
+        self.history_tab = HistoryTab(db_path)
+        self.stats_tab = StatsTab(db_path)
         self.tabs = QTabWidget()
         self.tabs.addTab(self.test_tab, "Test")
-        self.tabs.addTab(self._placeholder("History"), "History")
-        self.tabs.addTab(self._placeholder("Statistics"), "Statistics")
+        self.tabs.addTab(self.history_tab, "History")
+        self.tabs.addTab(self.stats_tab, "Statistics")
         self.setCentralWidget(self.tabs)
-
-    @staticmethod
-    def _placeholder(name: str) -> QWidget:
-        label = QLabel(f"{name} - coming soon")
-        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        label.setStyleSheet("color: #808080; font-size: 18pt;")
-        return label
+        # new runs refresh the other tabs (immediately if shown, else when next shown)
+        self.test_tab.run_saved.connect(lambda _run_id: self.history_tab.request_refresh())
+        self.test_tab.run_saved.connect(lambda _run_id: self.stats_tab.request_refresh())
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt override
         """Let a running job finish (and be saved) before the window and its thread go away."""

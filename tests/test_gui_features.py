@@ -112,6 +112,9 @@ def overlay_of(tab: TestTab, name: str) -> list[dict[str, Any]]:
     return outcome.result.overlay  # type: ignore[union-attr]
 
 
+# --- overlays and row highlighting -----------------------------------------------------
+
+
 def test_run_draws_every_overlay_of_the_shown_frame(window: MainWindow, paths: dict[str, Path]) -> None:
     tab = window.test_tab
     tab.set_frame("normal", paths["chart"])
@@ -188,6 +191,9 @@ def test_choosing_a_new_frame_hides_old_overlays_but_the_table_still_reviews_the
     assert tab.viewer.shapes == [] and "good.png" in tab.caption.text()
     click_row(tab, row_of(tab, "shading"))  # the table belongs to the previous run: review that image
     assert len(tab.viewer.shapes) == 5
+
+
+# --- webcam ----------------------------------------------------------------------------
 
 
 def test_webcam_capture_becomes_the_normal_frame(
@@ -273,6 +279,9 @@ def test_ui_stays_responsive_during_a_slow_capture(window: MainWindow, monkeypat
     wait_for(lambda: tab.capture_button.isEnabled() and not tab.is_running)
     timer.stop()
     assert len(ticks) >= 8, f"event loop was blocked, only {len(ticks)} ticks"
+
+
+# --- folder mode -----------------------------------------------------------------------
 
 
 @pytest.fixture
@@ -416,3 +425,58 @@ def test_progress_bar_widget_text_format(window: MainWindow) -> None:
     assert window.test_tab.progress_bar.format() == "%v / %m"
     assert window.test_tab.folder_frame_combo.count() == 4
     assert window.test_tab.capture_button.text() == "Capture from webcam"
+
+
+# --- History / Statistics are wired to new runs ------------------------------------------
+
+
+def test_tabs_are_the_real_history_and_statistics_tabs(window: MainWindow) -> None:
+    from camqc.gui.history_tab import HistoryTab
+    from camqc.gui.stats_tab import StatsTab
+
+    assert isinstance(window.history_tab, HistoryTab) and isinstance(window.stats_tab, StatsTab)
+    assert [window.tabs.tabText(i) for i in range(3)] == ["Test", "History", "Statistics"]
+    assert window.history_tab.is_stale and window.stats_tab.is_stale  # nothing is queried until shown
+
+
+def test_a_saved_run_refreshes_the_visible_statistics_and_the_history_when_opened(
+    window: MainWindow, paths: dict[str, Path]
+) -> None:
+    window.tabs.setCurrentWidget(window.stats_tab)  # first show loads an empty database
+    assert window.stats_tab.days == [] and window.stats_tab.summary_label.text() == "No runs"
+    assert window.history_tab.is_stale and window.history_tab.proxy.rowCount() == 0
+
+    window.tabs.setCurrentWidget(window.test_tab)
+    window.test_tab.set_frame("normal", paths["good"])
+    run_model(window, "M", "WIRED1")
+    assert window.stats_tab.is_stale  # hidden while the run finished
+
+    window.tabs.setCurrentWidget(window.stats_tab)  # showing it loads the new run
+    assert window.stats_tab.days[0]["total"] == 1 and "1 runs - overall yield 100.0%" in window.stats_tab.summary_label.text()
+    window.tabs.setCurrentWidget(window.history_tab)
+    assert [window.history_tab.proxy.index(r, 2).data() for r in range(window.history_tab.proxy.rowCount())] == ["WIRED1"]
+
+
+def test_statistics_updates_by_itself_while_it_is_shown(window: MainWindow, paths: dict[str, Path]) -> None:
+    window.tabs.setCurrentWidget(window.stats_tab)
+    window.test_tab.set_frame("normal", paths["good"])
+    window.test_tab.model_combo.setCurrentText("M")
+    window.test_tab.serial_edit.setText("LIVE1")
+    window.test_tab.start_run()  # the Test tab is hidden, but the run still works
+    wait_for(lambda: not window.test_tab.is_running)
+    wait_for(lambda: window.stats_tab.days != [])  # the visible tab refreshed after the coalescing delay
+    assert window.stats_tab.days[0]["passed"] == 1
+
+
+def test_a_folder_batch_causes_few_reloads_of_the_visible_tabs(
+    window: MainWindow, folder: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reloads: list[int] = []
+    real = window.stats_tab.reload
+    monkeypatch.setattr(window.stats_tab, "reload", lambda: (reloads.append(1), real())[1])
+    window.tabs.setCurrentWidget(window.stats_tab)
+    reloads.clear()
+    tab = start_folder(window, folder, monkeypatch)
+    wait_for(lambda: tab.folder_button.isEnabled() and not tab.is_running)
+    wait_for(lambda: window.stats_tab.days != [] and window.stats_tab.days[0]["total"] == 3)
+    assert 1 <= len(reloads) <= 2  # 3 saved images, but the reloads were coalesced
