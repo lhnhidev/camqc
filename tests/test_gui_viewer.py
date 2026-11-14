@@ -15,7 +15,7 @@ from PySide6.QtGui import QColor, QPixmap  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from camqc.checks.base import make_result  # noqa: E402
-from camqc.gui import viewer  # noqa: E402
+from camqc.gui import viewer, workers  # noqa: E402
 from camqc.gui.viewer import ScaledImageLabel, StyledShape, overlay_shapes  # noqa: E402
 from camqc.pipeline import (  # noqa: E402
     ERROR,
@@ -57,6 +57,9 @@ def black_label(qapp: QApplication, label_size: tuple[int, int], image_size: tup
     pixmap.fill(Qt.GlobalColor.black)
     label.set_image(pixmap)
     return label
+
+
+# --- drawing: correct scaling ----------------------------------------------------------
 
 
 def test_overlays_are_scaled_with_the_image(qapp: QApplication) -> None:
@@ -136,6 +139,9 @@ def test_unknown_shape_types_and_no_image_are_ignored(qapp: QApplication) -> Non
     assert empty.pixmap().isNull() and empty.text() == "No image"
 
 
+# --- which shapes are drawn --------------------------------------------------------------
+
+
 def outcome(name: str, status: str, frame: str | None, overlay: list[dict[str, Any]] | None = None) -> CheckOutcome:
     if status in (PASS, FAIL):
         return CheckOutcome(name, status, make_result(name, 1.0, "u", None, None, None, overlay), None, frame, 1.0)
@@ -177,3 +183,117 @@ def test_overlay_shapes_selection_edge_cases(run: RunResult) -> None:
     assert overlay_shapes(run, "dark", selected="c") == []  # check used another frame
     assert overlay_shapes(run, "dark", selected="e") == overlay_shapes(run, "dark", selected="f") == []  # no result
     assert overlay_shapes(run, "dark", selected="nope") == []
+
+
+# --- workers ---------------------------------------------------------------------------
+
+
+class FakeCapture:
+    """Stand-in for cv2.VideoCapture."""
+
+    instances: list[FakeCapture] = []
+
+    def __init__(self, opened: bool = True, frames: list[np.ndarray | None] | None = None) -> None:
+        self.opened, self.frames, self.reads, self.released = opened, list(frames or []), 0, False
+        FakeCapture.instances.append(self)
+
+    def isOpened(self) -> bool:  # noqa: N802 - cv2 API
+        return self.opened
+
+    def read(self) -> tuple[bool, np.ndarray | None]:
+        self.reads += 1
+        frame = self.frames.pop(0) if self.frames else None
+        return frame is not None, frame
+
+    def release(self) -> None:
+        self.released = True
+
+
+def patch_camera(monkeypatch: pytest.MonkeyPatch, **kwargs: Any) -> None:
+    FakeCapture.instances = []
+    monkeypatch.setattr(workers.cv2, "VideoCapture", lambda index: FakeCapture(**kwargs))
+
+
+def test_capture_frame_returns_the_last_warmed_up_frame_and_releases(monkeypatch: pytest.MonkeyPatch) -> None:
+    frames = [np.full((4, 4, 3), v, np.uint8) for v in range(10)]
+    patch_camera(monkeypatch, frames=frames)
+    image = workers.capture_frame(warmup=3)
+    cam = FakeCapture.instances[0]
+    assert image[0, 0, 0] == 3 and cam.reads == 4 and cam.released  # 3 warm-up frames + the real one
+
+
+def test_capture_frame_without_a_camera_gives_a_friendly_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    patch_camera(monkeypatch, opened=False)
+    with pytest.raises(workers.CameraError, match="No camera found") as info:
+        workers.capture_frame()
+    assert "not in use by another application" in str(info.value)
+    assert FakeCapture.instances[0].released  # always released, even on failure
+
+
+def test_capture_frame_when_the_camera_returns_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    patch_camera(monkeypatch, frames=[])
+    with pytest.raises(workers.CameraError, match="did not return an image"):
+        workers.capture_frame()
+    assert FakeCapture.instances[0].released
+
+
+def test_capture_worker_emits_frame_or_friendly_message(qapp: QApplication, monkeypatch: pytest.MonkeyPatch) -> None:
+    worker = workers.CaptureWorker()
+    got: list[Any] = []
+    worker.captured.connect(lambda img: got.append(("ok", img.shape)))
+    worker.failed.connect(lambda msg: got.append(("fail", msg)))
+    monkeypatch.setattr(workers, "capture_frame", lambda: np.zeros((2, 3, 3), np.uint8))
+    worker.run()
+    monkeypatch.setattr(workers, "capture_frame", lambda: (_ for _ in ()).throw(workers.CameraError("No camera found.")))
+    worker.run()
+    monkeypatch.setattr(workers, "capture_frame", lambda: (_ for _ in ()).throw(OSError("backend exploded")))
+    worker.run()
+    assert got == [("ok", (2, 3, 3)), ("fail", "No camera found."), ("fail", "Camera error: OSError: backend exploded")]
+
+
+@pytest.fixture
+def brightness_config() -> Config:
+    return parse_config({"models": {"M": {"checks": {"brightness": {
+        "frame": "normal", "params": {"mean_low": 100, "mean_high": 160}}}}}})
+
+
+def test_folder_worker_processes_every_file_and_survives_bad_ones(
+    qapp: QApplication, tmp_path: Path, brightness_config: Config
+) -> None:
+    files = [png(tmp_path / "a.png", 128), png(tmp_path / "b.png", 20)]
+    (tmp_path / "bad.png").write_bytes(b"garbage")
+    files.insert(1, tmp_path / "bad.png")
+    worker = workers.FolderWorker(files, "M", "normal", brightness_config)
+    events: list[Any] = []
+    worker.item_done.connect(lambda name, res, frames: events.append(("done", name, res.verdict, list(frames))))
+    worker.item_failed.connect(lambda name, msg: events.append(("failed", name, msg)))
+    worker.progress.connect(lambda done, total: events.append(("progress", done, total)))
+    worker.finished.connect(lambda cancelled: events.append(("finished", cancelled)))
+    worker.run()
+    assert events[0] == ("done", "a.png", PASS, ["normal"])
+    assert events[1] == ("progress", 1, 3)
+    assert events[2][:2] == ("failed", "bad.png") and "cannot decode image" in events[2][2]
+    assert events[4] == ("done", "b.png", FAIL, ["normal"])
+    assert [e for e in events if e[0] == "progress"] == [("progress", 1, 3), ("progress", 2, 3), ("progress", 3, 3)]
+    assert events[-1] == ("finished", False)
+
+
+def test_folder_worker_cancel_stops_before_the_next_file(
+    qapp: QApplication, tmp_path: Path, brightness_config: Config
+) -> None:
+    files = [png(tmp_path / f"{i}.png", 128) for i in range(5)]
+    worker = workers.FolderWorker(files, "M", "normal", brightness_config)
+    done: list[str] = []
+    finished: list[bool] = []
+    worker.item_done.connect(lambda name, *_: (done.append(name), worker.cancel() if len(done) == 2 else None))
+    worker.finished.connect(finished.append)
+    worker.run()
+    assert done == ["0.png", "1.png"] and finished == [True]
+
+    again = workers.FolderWorker(files, "M", "normal", brightness_config)
+    again.cancel()  # cancelled before starting: nothing is processed
+    out: list[Any] = []
+    again.item_done.connect(lambda *a: out.append(a))
+    again.finished.connect(out.append)
+    again.run()
+    assert out == [True]
