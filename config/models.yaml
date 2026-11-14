@@ -1,0 +1,10 @@
+# Per camera-model check thresholds.
+# Structure (to be finalized when checks are implemented):
+#
+# models:
+#   <model_name>:
+#     checks:
+#       <check_name>:
+#         enabled: true
+#         <threshold_param>: <value>
+models: {}
