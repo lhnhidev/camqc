@@ -109,6 +109,44 @@ def row_color(win: MainWindow, row: int) -> str:
     return win.test_tab.table.item(row, 0).background().color().name()
 
 
+# --- layout ----------------------------------------------------------------------------
+
+
+def test_has_three_tabs_and_form_widgets(window: MainWindow) -> None:
+    assert [window.tabs.tabText(i) for i in range(3)] == ["Test", "History", "Statistics"]
+    tab = window.test_tab
+    assert [tab.model_combo.itemText(i) for i in range(tab.model_combo.count())] == ["M", "N"]
+    assert tab.serial_edit.text() == "" and tab.station_edit.text() == "UNKNOWN"
+    assert set(tab.frame_buttons) == {"normal", "dark", "white", "flat"}
+    assert tab.run_button.isEnabled() and tab.run_button.text() == "Run"
+    assert [tab.table.horizontalHeaderItem(i).text() for i in range(5)] == [
+        "Check", "Value", "Unit", "Limits", "Status"]
+    assert tab.verdict_label.text() == "-"
+
+
+def test_models_come_from_the_shipped_yaml(qapp: QApplication, tmp_path: Path) -> None:
+    win = MainWindow(ROOT / "config" / "models.yaml", tmp_path / "x.db")
+    assert [win.test_tab.model_combo.itemText(i) for i in range(2)] == ["CAM_A", "CAM_B"]
+    win.close()
+
+
+def test_config_error_disables_run(qapp: QApplication, tmp_path: Path) -> None:
+    win = MainWindow(tmp_path / "missing.yaml", tmp_path / "x.db")
+    tab = win.test_tab
+    assert not tab.run_button.isEnabled() and tab.model_combo.count() == 0
+    assert "Configuration error" in tab.message_label.text()
+    win.close()
+
+
+def test_gui_script_entry_point_is_declared() -> None:
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]
+    assert project["gui-scripts"]["camqc-gui"] == "camqc.gui.main_window:main"
+    assert callable(main_window.main)
+
+
+# --- frames and viewer -----------------------------------------------------------------
+
+
 def test_choose_button_loads_frame_and_shows_it(
     window: MainWindow, paths: dict[str, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -162,6 +200,9 @@ def test_bgr_to_pixmap_keeps_colors_and_accepts_gray(qapp: QApplication) -> None
     assert image.pixelColor(0, 0).name() == "#0000ff"
     gray = main_window.bgr_to_pixmap(np.full((4, 5), 100, np.uint8)).toImage()
     assert (gray.width(), gray.height()) == (5, 4) and gray.pixelColor(0, 0).red() == 100
+
+
+# --- running ---------------------------------------------------------------------------
 
 
 def test_run_pass_fills_table_verdict_and_database(window: MainWindow, paths: dict[str, Path]) -> None:
@@ -314,6 +355,43 @@ def test_database_failure_still_shows_the_result(qapp: QApplication, paths: dict
     assert tab.verdict_label.text() == "PASS" and tab.table.rowCount() == 1
     assert "Result NOT saved" in tab.message_label.text()
     win.close()
+
+
+def test_closing_during_a_run_waits_for_the_worker(
+    qapp: QApplication, paths: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real = main_window.run_pipeline
+    monkeypatch.setattr(main_window, "run_pipeline", lambda *a: (time.sleep(0.3), real(*a))[1])
+    win = MainWindow(paths["config"], paths["db"])
+    tab = win.test_tab
+    tab.model_combo.setCurrentText("M")
+    tab.set_frame("normal", paths["good"])
+    tab.serial_edit.setText("CLOSE")
+    click(tab.run_button)
+    assert tab.is_running
+    assert win.close()  # blocks until the thread has finished instead of crashing
+    assert not tab.is_running  # no further event-loop turns needed ...
+    assert len(runs(paths, "CLOSE")) == 1  # ... and the finished run was saved, not lost
+
+
+def test_close_is_refused_if_the_pipeline_outlives_the_wait(
+    qapp: QApplication, paths: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real = main_window.run_pipeline
+    monkeypatch.setattr(main_window, "run_pipeline", lambda *a: (time.sleep(0.6), real(*a))[1])
+    monkeypatch.setattr(main_window, "SHUTDOWN_WAIT_MS", 50)
+    win = MainWindow(paths["config"], paths["db"])
+    win.show()
+    tab = win.test_tab
+    tab.model_combo.setCurrentText("M")
+    tab.set_frame("normal", paths["good"])
+    tab.serial_edit.setText("LONG")
+    click(tab.run_button)
+    assert win.close() is False and win.isVisible()  # refused; the thread is not destroyed
+    assert "still running" in tab.message_label.text()
+    wait_for(lambda: not tab.is_running)
+    assert len(runs(paths, "LONG")) == 1
+    assert win.close() is True
 
 
 def test_result_rows_and_colors() -> None:
