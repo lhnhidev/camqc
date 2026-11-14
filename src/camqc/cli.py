@@ -29,6 +29,7 @@ import cv2
 import numpy as np
 
 from camqc import db
+from camqc.checks.base import format_limits  # noqa: F401 - re-exported for the GUI
 from camqc.pipeline import (
     FRAME_TYPES,
     PASS,
@@ -134,17 +135,6 @@ def fail(message: str) -> None:
 def status_word(verdict: str, colorize: bool) -> str:
     """Return ``verdict``, wrapped in its ANSI color when ``colorize`` is set."""
     return f"{STATUS_COLORS[verdict]}{verdict}{ANSI_RESET}" if colorize and verdict in STATUS_COLORS else verdict
-
-
-def format_limits(low: float | None, high: float | None) -> str:
-    """Describe an acceptance range, e.g. ``100 .. 160``, ``>= 100``, ``<= 5`` or ``-``."""
-    if low is not None and high is not None:
-        return f"{low:g} .. {high:g}"
-    if low is not None:
-        return f">= {low:g}"
-    if high is not None:
-        return f"<= {high:g}"
-    return "-"
 
 
 def results_table(run: RunResult, colorize: bool) -> str:

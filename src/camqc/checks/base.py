@@ -75,6 +75,17 @@ def crop(img: np.ndarray, rect: Rect) -> np.ndarray:
     return img[y : y + h, x : x + w]
 
 
+def format_limits(low: float | None, high: float | None) -> str:
+    """Describe an acceptance range, e.g. ``100 .. 160``, ``>= 100``, ``<= 5`` or ``-``."""
+    if low is not None and high is not None:
+        return f"{low:g} .. {high:g}"
+    if low is not None:
+        return f">= {low:g}"
+    if high is not None:
+        return f"<= {high:g}"
+    return "-"
+
+
 def in_range(value: float, low: float | None, high: float | None) -> bool:
     """Return True if ``low <= value <= high``; a ``None`` bound is unbounded."""
     return (low is None or value >= low) and (high is None or value <= high)
