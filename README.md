@@ -12,17 +12,38 @@ application (`camqc-gui`).
 
 ## Screenshots
 
-Screenshots have not been added yet. Put them in `docs/screenshots/` and link them here.
+Taken from the desktop app and a generated report, using demo data: synthetic images from
+`tools/gen_samples.py` and made-up serial numbers.
 
-> **[Screenshot placeholder]** Test tab: frames, results table with colored rows, verdict.
->
-> **[Screenshot placeholder]** Test tab: overlay highlight after clicking a failing check.
->
-> **[Screenshot placeholder]** History tab and the run-detail dialog.
->
-> **[Screenshot placeholder]** Statistics tab: yield per day and failure Pareto.
->
-> **[Screenshot placeholder]** HTML report opened in a browser.
+**Test tab.** Choose the frames the model needs (or capture / load a folder), then press **Run**.
+
+![Test tab with the four frames chosen, ready to run](docs/screenshots/test-tab-frames.png)
+
+The result: a verdict, a table with one colored row per check, and the image with the checks'
+overlays (green = passing check, red = failing check).
+
+![Test tab after a run: verdict FAIL, two failing checks, overlays on the flat frame](docs/screenshots/test-tab.png)
+
+Clicking a row highlights only that check's overlay (here the six blemishes found by `blemish`).
+
+![Test tab with the overlay of the blemish check highlighted](docs/screenshots/test-tab-overlay.png)
+
+**History tab.** Search by serial, filter by date and verdict, sort by any column.
+
+![History tab with the table of runs](docs/screenshots/history-tab.png)
+
+Double-clicking a run opens its per-check results.
+
+![Run detail dialog](docs/screenshots/run-detail.png)
+
+**Statistics tab.** Yield per day and a Pareto chart of the failing checks.
+
+![Statistics tab with yield per day and the failure Pareto](docs/screenshots/statistics-tab.png)
+
+**HTML report** (`camqc report --run-id N`, or the **Export report** button): a single file with
+the results table and the input images with the overlays drawn on them (top of the page shown).
+
+![HTML report opened in a browser](docs/screenshots/html-report.png)
 
 ## Features
 
