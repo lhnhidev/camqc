@@ -20,8 +20,9 @@ from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication, QFileDialog  # noqa: E402
 
 from camqc import db  # noqa: E402
-from camqc.gui import main_window  # noqa: E402
+from camqc.gui import main_window, workers  # noqa: E402
 from camqc.gui.main_window import MainWindow, ScaledImageLabel  # noqa: E402
+from gui_support import click, png, wait_for  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -44,27 +45,6 @@ models:
 """
 
 
-@pytest.fixture(scope="session")
-def qapp() -> Iterator[QApplication]:
-    yield QApplication.instance() or QApplication([])
-
-
-def wait_for(condition: Callable[[], bool], timeout: float = 20.0) -> None:
-    """Pump the Qt event loop until ``condition()`` is true."""
-    end = time.monotonic() + timeout
-    while time.monotonic() < end:
-        QApplication.processEvents()
-        if condition():
-            return
-        time.sleep(0.005)
-    raise AssertionError("timed out waiting for condition")
-
-
-def png(path: Path, value: int, size: tuple[int, int] = (60, 80)) -> Path:
-    assert cv2.imwrite(str(path), np.full((*size, 3), value, np.uint8))
-    return path
-
-
 @pytest.fixture
 def paths(tmp_path: Path) -> dict[str, Path]:
     config = tmp_path / "models.yaml"
@@ -84,10 +64,6 @@ def window(qapp: QApplication, paths: dict[str, Path]) -> Iterator[MainWindow]:
     yield win
     win.close()
     QApplication.processEvents()
-
-
-def click(widget: Any) -> None:
-    QTest.mouseClick(widget, Qt.MouseButton.LeftButton)
 
 
 def run_and_wait(win: MainWindow, serial: str = "S001") -> None:
@@ -259,7 +235,7 @@ def test_frames_are_cleared_after_a_run_so_a_scan_cannot_reuse_them(
 def test_frames_are_kept_when_the_pipeline_itself_fails(
     window: MainWindow, paths: dict[str, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(main_window, "run_pipeline", lambda *a: (_ for _ in ()).throw(RuntimeError("x")))
+    monkeypatch.setattr(workers, "run_pipeline", lambda *a: (_ for _ in ()).throw(RuntimeError("x")))
     tab = window.test_tab
     tab.model_combo.setCurrentText("M")
     tab.set_frame("normal", paths["good"])
@@ -305,13 +281,13 @@ def test_blank_serial_or_missing_frames_do_not_start(window: MainWindow, paths: 
 def test_ui_stays_responsive_while_pipeline_runs(
     window: MainWindow, paths: dict[str, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    real = main_window.run_pipeline
+    real = workers.run_pipeline
 
     def slow(model: str, frames: Any, config: Any) -> Any:
         time.sleep(0.5)
         return real(model, frames, config)
 
-    monkeypatch.setattr(main_window, "run_pipeline", slow)
+    monkeypatch.setattr(workers, "run_pipeline", slow)
     tab = window.test_tab
     tab.model_combo.setCurrentText("M")
     tab.set_frame("normal", paths["good"])
@@ -335,7 +311,7 @@ def test_pipeline_exception_is_reported_and_run_reenabled(
     def boom(*args: Any, **kwargs: Any) -> Any:
         raise RuntimeError("kaboom")
 
-    monkeypatch.setattr(main_window, "run_pipeline", boom)
+    monkeypatch.setattr(workers, "run_pipeline", boom)
     tab = window.test_tab
     tab.model_combo.setCurrentText("M")
     tab.set_frame("normal", paths["good"])
@@ -360,8 +336,8 @@ def test_database_failure_still_shows_the_result(qapp: QApplication, paths: dict
 def test_closing_during_a_run_waits_for_the_worker(
     qapp: QApplication, paths: dict[str, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    real = main_window.run_pipeline
-    monkeypatch.setattr(main_window, "run_pipeline", lambda *a: (time.sleep(0.3), real(*a))[1])
+    real = workers.run_pipeline
+    monkeypatch.setattr(workers, "run_pipeline", lambda *a: (time.sleep(0.3), real(*a))[1])
     win = MainWindow(paths["config"], paths["db"])
     tab = win.test_tab
     tab.model_combo.setCurrentText("M")
@@ -377,8 +353,8 @@ def test_closing_during_a_run_waits_for_the_worker(
 def test_close_is_refused_if_the_pipeline_outlives_the_wait(
     qapp: QApplication, paths: dict[str, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    real = main_window.run_pipeline
-    monkeypatch.setattr(main_window, "run_pipeline", lambda *a: (time.sleep(0.6), real(*a))[1])
+    real = workers.run_pipeline
+    monkeypatch.setattr(workers, "run_pipeline", lambda *a: (time.sleep(0.6), real(*a))[1])
     monkeypatch.setattr(main_window, "SHUTDOWN_WAIT_MS", 50)
     win = MainWindow(paths["config"], paths["db"])
     win.show()

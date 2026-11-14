@@ -1,9 +1,9 @@
 """Main window: image source selection, live preview, run checks, and per-check PASS/FAIL display.
 
 A ``QMainWindow`` with three tabs: *Test* (this module), and *History* / *Statistics*
-placeholders. The pipeline runs in a ``QThread`` worker so the UI never freezes; the run
-is saved to SQLite on the GUI thread when the worker finishes (sqlite3 connections must
-not cross threads).
+placeholders. Anything slow (pipeline, webcam capture, folder batches) runs in a ``QThread``
+worker (see :mod:`camqc.gui.workers`) so the UI never freezes; runs are saved to SQLite on the
+GUI thread because sqlite3 connections must not cross threads.
 """
 
 from __future__ import annotations
@@ -16,8 +16,8 @@ from datetime import datetime
 from pathlib import Path
 
 import numpy as np
-from PySide6.QtCore import QCoreApplication, QObject, QSize, Qt, QThread, Signal, Slot
-from PySide6.QtGui import QBrush, QCloseEvent, QColor, QFont, QImage, QPixmap, QResizeEvent
+from PySide6.QtCore import QCoreApplication, QObject, Qt, QThread, SignalInstance, Slot
+from PySide6.QtGui import QBrush, QCloseEvent, QColor, QFont, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -31,7 +31,6 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QPushButton,
-    QSizePolicy,
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
@@ -50,15 +49,14 @@ from camqc.cli import (
     setup_logging,
     teardown_logging,
 )
+from camqc.gui.viewer import ScaledImageLabel, bgr_to_pixmap, overlay_shapes
+from camqc.gui.workers import PipelineWorker
 from camqc.pipeline import (
-    FAIL,
-    FRAME_TYPES,
     PASS,
     Config,
     ConfigError,
     RunResult,
     load_config,
-    run_pipeline,
 )
 
 logger = logging.getLogger(__name__)
@@ -76,19 +74,11 @@ STATUS_COLORS: Mapping[str, tuple[str, str]] = {  # status -> (background, text)
     "ERROR": (RED, "#9c0006"),
 }
 NEUTRAL_COLORS = (GRAY, "#404040")
-SHUTDOWN_WAIT_MS = 30_000  # how long closing the window waits for a running pipeline
+SHUTDOWN_WAIT_MS = 30_000  # how long closing the window waits for a running job
 TABLE_HEADERS = ("Check", "Value", "Unit", "Limits", "Status")
 
 
 # --- helpers ---------------------------------------------------------------------------
-
-
-def bgr_to_pixmap(image_bgr: np.ndarray) -> QPixmap:
-    """Convert a BGR (or gray) uint8 image to a ``QPixmap`` that owns its pixel data."""
-    rgb = np.ascontiguousarray(image_bgr[..., ::-1]) if image_bgr.ndim == 3 else np.ascontiguousarray(image_bgr)
-    h, w = rgb.shape[:2]
-    fmt = QImage.Format.Format_RGB888 if rgb.ndim == 3 else QImage.Format.Format_Grayscale8
-    return QPixmap.fromImage(QImage(rgb.data, w, h, rgb.strides[0], fmt).copy())
 
 
 def colors_for(status: str) -> tuple[str, str]:
@@ -113,75 +103,11 @@ def result_rows(result: RunResult) -> list[tuple[list[str], str, str]]:
     return rows
 
 
-class ScaledImageLabel(QLabel):
-    """A label that shows an image scaled to fit its size, keeping the aspect ratio.
-
-    It ignores the pixmap's size in layouts, so large images never enlarge the window.
-    """
-
-    def __init__(self, placeholder: str = "No image", parent: QWidget | None = None) -> None:
-        super().__init__(placeholder, parent)
-        self._source: QPixmap | None = None
-        self._placeholder = placeholder
-        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.setMinimumSize(QSize(240, 160))
-        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
-        self.setStyleSheet("background: #202020; color: #909090; border: 1px solid #505050;")
-
-    def set_image(self, pixmap: QPixmap | None) -> None:
-        """Show ``pixmap`` (or the placeholder text when ``None``)."""
-        self._source = pixmap
-        self._refresh()
-
-    def _refresh(self) -> None:
-        """Scale the source image to the current size (or show the placeholder)."""
-        if self._source is None or self._source.isNull():
-            self.setPixmap(QPixmap())
-            self.setText(self._placeholder)
-            return
-        self.setPixmap(self._source.scaled(
-            self.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation
-        ))
-
-    def resizeEvent(self, event: QResizeEvent) -> None:  # noqa: N802 - Qt override
-        """Rescale the image whenever the label is resized."""
-        super().resizeEvent(event)
-        if self._source is not None:
-            self._refresh()
-
-
-class PipelineWorker(QObject):
-    """Runs the pipeline off the GUI thread.
-
-    Signals:
-        finished(RunResult): the run completed.
-        failed(str): the pipeline itself raised (individual check errors are not failures).
-    """
-
-    finished = Signal(object)
-    failed = Signal(str)
-
-    def __init__(self, model: str, frames: Mapping[str, np.ndarray], config: Config) -> None:
-        super().__init__()
-        self._model, self._frames, self._config = model, dict(frames), config
-
-    @Slot()
-    def run(self) -> None:
-        """Execute the pipeline and emit the outcome."""
-        try:
-            result = run_pipeline(self._model, self._frames, self._config)
-        except Exception as exc:  # noqa: BLE001 - never let a worker exception kill the thread silently
-            logger.exception("pipeline failed")
-            self.failed.emit(f"{type(exc).__name__}: {exc}")
-        else:
-            self.finished.emit(result)
-
-
 # --- Test tab --------------------------------------------------------------------------
 
 
 class TestTab(QWidget):
-    """The *Test* tab: choose model/serial/frames, run, and see per-check results."""
+    """The *Test* tab: choose model/serial/frames, run, and see per-check results with overlays."""
 
     __test__ = False  # not a pytest test class despite the name
 
@@ -190,15 +116,21 @@ class TestTab(QWidget):
         self._config = config
         self._db_path = db_path
         self._frames: dict[str, np.ndarray] = {}
+        self._pixmaps: dict[str, QPixmap] = {}  # pixmaps of the chosen frames
         self._frame_paths: dict[str, Path] = {}
         self._last_dir = ""
         self._thread: QThread | None = None
-        self._worker: PipelineWorker | None = None
+        self._worker: QObject | None = None
         self._pending: tuple[str, str, str] | None = None  # (model, serial, station) of the active run
+        self._run_pixmaps: dict[str, QPixmap] = {}  # snapshot taken when a run starts
+        self._review_pixmaps: dict[str, QPixmap] = {}  # images that belong to the shown result
+        self._last_result: RunResult | None = None
+        self._viewer_frame: str | None = None  # frame type shown in the viewer
+        self._viewer_shows_review = False  # True if the viewer shows an image of the shown result
         self._build_ui()
         if config_error:
             self.show_message(config_error, error=True)
-            self.run_button.setEnabled(False)
+            self._set_busy(False)
 
     # -- construction --
 
@@ -256,9 +188,11 @@ class TestTab(QWidget):
         self.table.setHorizontalHeaderLabels(list(TABLE_HEADERS))
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         self.table.verticalHeader().setVisible(False)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.itemSelectionChanged.connect(self._on_selection_changed)
 
         self.message_label = QLabel("", objectName="message_label", wordWrap=True)
 
@@ -289,7 +223,7 @@ class TestTab(QWidget):
 
     @property
     def is_running(self) -> bool:
-        """True while a worker thread is active."""
+        """True while a background job is active."""
         return self._thread is not None
 
     def show_message(self, text: str, error: bool = False) -> None:
@@ -303,6 +237,41 @@ class TestTab(QWidget):
         self.verdict_label.setStyleSheet(
             f"background: {bg}; color: {fg}; border-radius: 8px; padding: 8px;"
         )
+
+    def _set_busy(self, busy: bool) -> None:
+        """Enable or disable the Run and frame buttons while a job runs.
+
+        The frame buttons are disabled too: a frame chosen mid-run would never be tested.
+        """
+        self.run_button.setEnabled(not busy and self._config is not None)
+        for button in self.frame_buttons.values():
+            button.setEnabled(not busy)
+
+    def _launch(self, worker: QObject, *end_signals: SignalInstance) -> None:
+        """Run ``worker`` in a new thread that quits when any of ``end_signals`` fires.
+
+        Result slots must be connected to the signals *before* calling this, so that they
+        run before the thread is told to quit.
+        """
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)  # type: ignore[attr-defined]
+        for signal in end_signals:
+            signal.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(self._on_thread_done)
+        self._thread, self._worker = thread, worker
+        self._set_busy(True)
+        thread.start()
+
+    @Slot()
+    def _on_thread_done(self) -> None:
+        """Release the finished thread and re-enable the buttons."""
+        thread, self._thread, self._worker = self._thread, None, None
+        if thread is not None:
+            thread.deleteLater()
+        self._pending = None
+        self._set_busy(False)
 
     # -- frames --
 
@@ -328,19 +297,36 @@ class TestTab(QWidget):
             self.show_message(str(exc), error=True)
             return False
         path = Path(path)
-        self._frames[frame], self._frame_paths[frame] = image, path
+        self._frame_paths[frame] = path
         self._last_dir = str(path.parent)
-        label = self.frame_labels[frame]
-        label.setText(path.name)
-        label.setToolTip(str(path))
-        label.setStyleSheet("")
-        self.viewer.set_image(bgr_to_pixmap(image))
-        h, w = image.shape[:2]
-        self.caption.setText(f"{frame.capitalize()}: {path.name}  ({w}x{h})")
-        self.show_message("")
+        self._install_frame(frame, image, path.name, str(path))
         return True
 
-    # -- running --
+    def _install_frame(self, frame: str, image: np.ndarray, source: str, tooltip: str) -> None:
+        """Store ``image`` as the ``frame`` input and show it (without overlays) in the viewer."""
+        pixmap = bgr_to_pixmap(image)
+        self._frames[frame], self._pixmaps[frame] = image, pixmap
+        label = self.frame_labels[frame]
+        label.setText(source)
+        label.setToolTip(tooltip)
+        label.setStyleSheet("")
+        self.viewer.set_image(pixmap)
+        self._viewer_frame, self._viewer_shows_review = frame, False
+        h, w = image.shape[:2]
+        self.caption.setText(f"{frame.capitalize()}: {source}  ({w}x{h})")
+        self.show_message("")
+
+    def _clear_frames(self) -> None:
+        """Forget the chosen frames (the viewer keeps showing the last image for review)."""
+        self._frames.clear()
+        self._pixmaps.clear()
+        self._frame_paths.clear()
+        for label in self.frame_labels.values():
+            label.setText("not selected")
+            label.setToolTip("")
+            label.setStyleSheet("color: #808080;")
+
+    # -- running one unit --
 
     @Slot()
     def start_run(self) -> None:
@@ -358,33 +344,17 @@ class TestTab(QWidget):
         model = self.model_combo.currentText()
         station = self.station_edit.text().strip() or DEFAULT_STATION
         self._pending = (model, serial, station)
-
-        self.run_button.setEnabled(False)
+        self._run_pixmaps = dict(self._pixmaps)
         self.show_message(f"Running {model} on {serial}...")
         self._style_verdict("RUNNING")
 
-        thread = QThread(self)
         worker = PipelineWorker(model, self._frames, self._config)
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
         worker.finished.connect(self._on_finished)
         worker.failed.connect(self._on_failed)
-        worker.finished.connect(thread.quit)
-        worker.failed.connect(thread.quit)
-        thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(self._on_thread_done)
-        self._thread, self._worker = thread, worker
-        thread.start()
+        self._launch(worker, worker.finished, worker.failed)
 
-    @Slot(object)
-    def _on_finished(self, result: RunResult) -> None:
-        """Show the result and save it to the database (on the GUI thread)."""
-        self.show_result(result)
-        self._clear_frames()  # a scan + Enter must never re-run the previous unit's images
-        if self._pending is None:
-            logger.error("run finished without pending run info; result not saved")
-            return
-        model, serial, station = self._pending
+    def _save_run(self, model: str, serial: str, station: str, result: RunResult) -> int | None:
+        """Save a run on the GUI thread; return its id, or ``None`` after showing the error."""
         try:
             conn = db.init_db(self._db_path)
             try:
@@ -394,8 +364,21 @@ class TestTab(QWidget):
         except (sqlite3.Error, OSError, ValueError) as exc:
             logger.exception("could not save run")
             self.show_message(f"Result NOT saved: {exc}", error=True)
+            return None
+        return run_id
+
+    @Slot(object)
+    def _on_finished(self, result: RunResult) -> None:
+        """Show the result and save it to the database (on the GUI thread)."""
+        self._show_run(result, self._run_pixmaps)
+        self._clear_frames()  # a scan + Enter must never re-run the previous unit's images
+        if self._pending is None:
+            logger.error("run finished without pending run info; result not saved")
             return
-        self.show_message(f"Saved as run #{run_id} ({result.duration_ms:.0f} ms)")
+        model, serial, station = self._pending
+        run_id = self._save_run(model, serial, station, result)
+        if run_id is not None:
+            self.show_message(f"Saved as run #{run_id} ({result.duration_ms:.0f} ms)")
 
     @Slot(str)
     def _on_failed(self, message: str) -> None:
@@ -404,27 +387,55 @@ class TestTab(QWidget):
         self.table.setRowCount(0)
         self.show_message(f"Pipeline failed: {message}", error=True)
 
-    @Slot()
-    def _on_thread_done(self) -> None:
-        """Release the finished thread and re-enable Run."""
-        thread, self._thread, self._worker = self._thread, None, None
-        if thread is not None:
-            thread.deleteLater()
-        self._pending = None
-        self.run_button.setEnabled(self._config is not None)
+    # -- results and overlays --
 
-    def _clear_frames(self) -> None:
-        """Forget the chosen frames (the viewer keeps showing the last image for review)."""
-        self._frames.clear()
-        self._frame_paths.clear()
-        for label in self.frame_labels.values():
-            label.setText("not selected")
-            label.setToolTip("")
-            label.setStyleSheet("color: #808080;")
+    def _show_run(self, result: RunResult, pixmaps: Mapping[str, QPixmap]) -> None:
+        """Show a result: table, verdict, and its images (with overlays) for review."""
+        self._last_result = result
+        self._review_pixmaps = dict(pixmaps)
+        self.show_result(result)
+        frame = self._viewer_frame if self._viewer_frame in self._review_pixmaps else next(
+            (o.frame for o in result.results if o.frame in self._review_pixmaps), None
+        )
+        if frame is not None:
+            self._show_frame(frame)
+
+    def _show_frame(self, frame: str, selected: str | None = None) -> None:
+        """Show the review image of ``frame`` with overlays (only ``selected``'s if given)."""
+        pixmap = self._review_pixmaps.get(frame)
+        if pixmap is None or self._last_result is None:
+            return
+        shapes = overlay_shapes(self._last_result, frame, selected)
+        self.viewer.set_image(pixmap)
+        self.viewer.set_overlays(shapes)
+        self._viewer_frame, self._viewer_shows_review = frame, True
+        what = f"{selected}: {len(shapes)} overlay shape(s)" if selected else f"{len(shapes)} overlay shape(s)"
+        self.caption.setText(f"{frame.capitalize()} frame - {what}")
+
+    @Slot()
+    def _on_selection_changed(self) -> None:
+        """Highlight only the clicked check's overlay (or show all again when nothing is selected)."""
+        result = self._last_result
+        rows = self.table.selectionModel().selectedRows()
+        if result is None:
+            return
+        if not rows:
+            if self._viewer_shows_review and self._viewer_frame:
+                self._show_frame(self._viewer_frame)
+            return
+        name = self.table.item(rows[0].row(), 0).text()
+        outcome = next((o for o in result.results if o.name == name), None)
+        if outcome is None or outcome.frame is None:  # skipped: it has no image
+            self.viewer.set_overlays([])
+            if self._viewer_shows_review:  # keep the caption of a freshly chosen frame
+                self.caption.setText(f"{name}: {outcome.status if outcome else '?'} - nothing to draw")
+            return
+        self._show_frame(outcome.frame, selected=name)
 
     def show_result(self, result: RunResult) -> None:
         """Fill the table (green/red/amber rows) and the big verdict label."""
         rows = result_rows(result)
+        self.table.blockSignals(True)
         self.table.setRowCount(len(rows))
         for r, (cells, status, note) in enumerate(rows):
             bg, fg = colors_for(status)
@@ -435,22 +446,24 @@ class TestTab(QWidget):
                 if note:
                     item.setToolTip(note)
                 self.table.setItem(r, c, item)
+        self.table.clearSelection()
+        self.table.blockSignals(False)
         self._style_verdict(result.verdict)
 
     def shutdown(self) -> bool:
-        """Wait for a running worker and deliver its queued result (so the run is saved).
+        """Wait for a running job and deliver its queued results (so the run is saved).
 
         Returns:
-            True if no worker is running any more; False if it did not finish within
+            True if no job is running any more; False if it did not finish within
             ``SHUTDOWN_WAIT_MS`` (the thread must then be kept alive, so do not close).
         """
         if self._thread is None:
             return True
         self._thread.quit()
         if not self._thread.wait(SHUTDOWN_WAIT_MS):
-            logger.warning("pipeline still running after %d ms; not closing", SHUTDOWN_WAIT_MS)
+            logger.warning("job still running after %d ms; not closing", SHUTDOWN_WAIT_MS)
             return False
-        QCoreApplication.sendPostedEvents()  # run the queued _on_finished (DB save) before exiting
+        QCoreApplication.sendPostedEvents()  # run the queued result slots (DB saves) before exiting
         return True
 
 
@@ -486,9 +499,9 @@ class MainWindow(QMainWindow):
         return label
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt override
-        """Let a running test finish (and be saved) before the window and its thread go away."""
+        """Let a running job finish (and be saved) before the window and its thread go away."""
         if not self.test_tab.shutdown():
-            self.test_tab.show_message("A test is still running - wait for it to finish.", error=True)
+            self.test_tab.show_message("A job is still running - wait for it to finish.", error=True)
             event.ignore()
             return
         super().closeEvent(event)
