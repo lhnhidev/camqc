@@ -28,3 +28,4 @@ Thumbs.db
 *.sqlite3
 reports/
 samples/
+logs/

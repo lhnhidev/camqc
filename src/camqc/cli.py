@@ -262,3 +262,208 @@ def execute(
     logger.info("run %d serial=%s model=%s verdict=%s failed=%s",
                 run_id, serial, model, result.verdict, list(result.failed_checks))
     return run_id, result
+
+
+# --- commands --------------------------------------------------------------------------
+
+
+def cmd_init_db(args: argparse.Namespace) -> int:
+    """``init-db``: create the database file and schema."""
+    db.init_db(args.db).close()
+    emit(f"Initialized database: {args.db}")
+    return EXIT_OK
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    """``run``: test one unit from up to four frames and store the result."""
+    if not args.serial.strip():
+        raise CliError("--serial must not be blank")
+    paths = {t: getattr(args, t) for t in FRAME_TYPES if getattr(args, t)}
+    if not paths:
+        raise CliError("give at least one frame: --normal, --flat, --dark or --white")
+    config = load_config_for(args)
+    frames = {t: load_image(p) for t, p in paths.items()}
+    colorize = use_color(sys.stdout)
+    conn = db.init_db(args.db)
+    try:
+        run_id, result = execute(conn, config, args.model, args.serial, args.station, frames)
+    finally:
+        conn.close()
+    emit(f"Serial {args.serial}  Model {args.model}  Station {args.station}  "
+         f"Run #{run_id}  {result.duration_ms:.0f} ms")
+    emit(results_table(result, colorize))
+    emit(f"Verdict: {status_word(result.verdict, colorize)}")
+    return exit_code_for(result.verdict)
+
+
+def list_images(directory: Path) -> list[Path]:
+    """Return the image files directly inside ``directory``, sorted by name."""
+    if not directory.is_dir():
+        raise CliError(f"directory not found: {directory}")
+    files = sorted(p for p in directory.iterdir() if p.suffix.lower() in IMAGE_SUFFIXES)
+    if not files:
+        raise CliError(f"no images found in {directory}")
+    return files
+
+
+def cmd_batch(args: argparse.Namespace) -> int:
+    """``batch``: test every image in a folder as one unit (serial = file name stem)."""
+    config = load_config_for(args)
+    files = list_images(Path(args.dir))
+    colorize = use_color(sys.stdout)
+    rows: list[list[str]] = []
+    errors, not_pass = 0, 0
+    conn = db.init_db(args.db)
+    try:
+        for path in files:
+            try:
+                frames = {args.frame: load_image(path)}
+                run_id, result = execute(conn, config, args.model, path.stem, args.station, frames)
+            except (CliError, ValueError) as exc:  # bad image, or a serial the database rejects
+                logger.warning("batch %s: %s", path, exc)
+                fail(str(exc))
+                errors += 1
+                rows.append([path.name, path.stem, "ERROR", "-", "-"])
+                continue
+            not_pass += result.verdict != PASS
+            rows.append([path.name, path.stem, result.verdict, ", ".join(result.failed_checks) or "-", str(run_id)])
+    finally:
+        conn.close()
+    emit(format_table(["file", "serial", "verdict", "failed checks", "run"], rows, colorize))
+    emit(f"{len(files)} images: {len(files) - not_pass - errors} PASS, {not_pass} not PASS, {errors} errors")
+    return EXIT_ERROR if errors else (EXIT_NOT_PASS if not_pass else EXIT_OK)
+
+
+def cmd_history(args: argparse.Namespace) -> int:
+    """``history``: list all runs of a serial, newest first (``--detail`` adds check tables)."""
+    colorize = use_color(sys.stdout)
+    conn = open_existing_db(args.db)
+    try:
+        runs = db.find_by_serial(conn, args.serial)
+        details = [d for r in runs if args.detail and (d := db.get_run_detail(conn, r["id"]))]
+    finally:
+        conn.close()
+    if not runs:
+        emit(f"No runs found for serial {args.serial}")
+        return EXIT_OK
+    emit(format_table(
+        ["run", "started", "model", "station", "verdict", "ms"],
+        [[r["id"], r["started_at"], r["model"], r["station"], r["verdict"], r["duration_ms"]] for r in runs],
+        colorize, "rllllr",
+    ))
+    for detail in details:
+        emit(f"\nRun #{detail['id']} ({detail['started_at']}, {detail['verdict']})")
+        emit(format_table(
+            ["check", "status", "value", "limits", "note"],
+            [[x["check_name"], x["status"],
+              f"{x['value']:.5g} {x['unit']}" if x["value"] is not None else "-",
+              format_limits(x["low"], x["high"]),
+              x["reason"] or x["details"].get("reason", "")] for x in detail["results"]],
+            colorize,
+        ))
+    return EXIT_OK
+
+
+def cmd_stats(args: argparse.Namespace) -> int:
+    """``stats``: yield per day and Pareto of failing checks for a date range."""
+    colorize = use_color(sys.stdout)
+    conn = open_existing_db(args.db)
+    try:
+        days = db.yield_by_day(conn, args.date_from, args.date_to)
+        pareto = db.pareto_failures(conn, args.date_from, args.date_to)
+    finally:
+        conn.close()
+    if not days:
+        emit("No runs in the selected range")
+        return EXIT_OK
+    emit("Yield by day")
+    emit(format_table(
+        ["day", "total", "pass", "fail", "incomplete", "yield %"],
+        [[d["day"], d["total"], d["passed"], d["failed"], d["incomplete"], f"{d['yield_pct']:.1f}"] for d in days],
+        colorize, "lrrrrr",
+    ))
+    emit("\nPareto of failures")
+    if pareto:
+        emit(format_table(
+            ["check", "fails", "%", "cumulative %"],
+            [[p["check_name"], p["fail_count"], f"{p['pct']:.1f}", f"{p['cumulative_pct']:.1f}"] for p in pareto],
+            colorize, "lrrr",
+        ))
+    else:
+        emit("No failures")
+    return EXIT_OK
+
+
+# --- parser / main ---------------------------------------------------------------------
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Build the argument parser with all sub-commands."""
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--log-file", type=Path, default=DEFAULT_LOG, help=f"log file (default: {DEFAULT_LOG})")
+    common.add_argument("-v", "--verbose", action="store_true", help="debug logging")
+
+    storage = argparse.ArgumentParser(add_help=False, parents=[common])
+    storage.add_argument("--db", default=DEFAULT_DB, help=f"SQLite database (default: {DEFAULT_DB})")
+
+    testing = argparse.ArgumentParser(add_help=False, parents=[storage])
+    testing.add_argument("--model", required=True, help="camera model from the config, e.g. CAM_A")
+    testing.add_argument("--station", default="UNKNOWN", help="test station id (default: UNKNOWN)")
+    testing.add_argument("--config", type=Path, help="models YAML (default: config/models.yaml)")
+
+    parser = argparse.ArgumentParser(prog="camqc", description="Camera module image quality checks.")
+    sub = parser.add_subparsers(dest="command", required=True, metavar="command")
+
+    p = sub.add_parser("init-db", parents=[storage], help="create the database")
+    p.set_defaults(func=cmd_init_db)
+
+    p = sub.add_parser("run", parents=[testing], help="test one unit from its frames")
+    p.add_argument("--serial", required=True, help="module serial number")
+    for frame in FRAME_TYPES:
+        p.add_argument(f"--{frame}", type=Path, metavar="IMAGE", help=f"image for the '{frame}' frame")
+    p.set_defaults(func=cmd_run)
+
+    p = sub.add_parser("batch", parents=[testing], help="test every image in a folder")
+    p.add_argument("--dir", required=True, type=Path, help="folder of images; serial = file name stem")
+    p.add_argument("--frame", choices=FRAME_TYPES, default="normal",
+                   help="frame type given to each image (default: normal)")
+    p.set_defaults(func=cmd_batch)
+
+    p = sub.add_parser("history", parents=[storage], help="show runs of a serial")
+    p.add_argument("--serial", required=True)
+    p.add_argument("--detail", action="store_true", help="also print each run's check results")
+    p.set_defaults(func=cmd_history)
+
+    p = sub.add_parser("stats", parents=[storage], help="yield per day and failure Pareto")
+    p.add_argument("--from", dest="date_from", type=parse_day, help="first day, YYYY-MM-DD")
+    p.add_argument("--to", dest="date_to", type=parse_day, help="last day (inclusive), YYYY-MM-DD")
+    p.set_defaults(func=cmd_stats)
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Run the CLI and return the process exit code (0 PASS, 1 FAIL/INCOMPLETE, 2 error)."""
+    parser = build_parser()
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit as exc:  # argparse exits with 2 on bad usage and 0 on --help
+        return int(exc.code or 0)
+    handler = setup_logging(args.log_file, args.verbose)
+    try:
+        return int(args.func(args))
+    except (CliError, ConfigError) as exc:
+        logger.error("%s", exc)
+        fail(str(exc))
+    except sqlite3.Error as exc:
+        logger.exception("database error")
+        fail(f"database error: {exc}")
+    except Exception as exc:  # noqa: BLE001 - last resort: report instead of a traceback
+        logger.exception("unexpected error")
+        fail(f"unexpected {type(exc).__name__}: {exc} (see {args.log_file})")
+    finally:
+        teardown_logging(handler)
+    return EXIT_ERROR
+
+
+if __name__ == "__main__":
+    sys.exit(main())
