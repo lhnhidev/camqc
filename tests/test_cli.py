@@ -99,7 +99,7 @@ def test_run_pass(frames: dict[str, Path], env: list[str], tmp_path: Path, capsy
     out = capsys.readouterr().out
     assert "Verdict: PASS" in out and "Serial S001  Model CAM_A  Station ST01  Run #1" in out
     for name in ("brightness", "sharpness", "pixels_hot", "pixels_dead", "shading", "color", "blemish"):
-        assert re.search(rf"^{name}\s+PASS", out, re.M), name
+        assert re.search(rf"^{name}\s+PASS", out, re.MULTILINE), name
     assert "\x1b[" not in out  # not a TTY -> no colors
     conn = db.init_db(tmp_path / "t.db")
     (stored,) = db.find_by_serial(conn, "S001")
@@ -114,14 +114,14 @@ def test_run_fail_exit_code_1(frames: dict[str, Path], env: list[str], capsys: p
     assert cli.main([*run_args(frames, dark="dark_bad"), *env]) == 1
     out = capsys.readouterr().out
     assert "Verdict: FAIL" in out
-    assert re.search(r"^pixels_hot\s+FAIL .*hot pixels above max 5", out, re.M)
+    assert re.search(r"^pixels_hot\s+FAIL .*hot pixels above max 5", out, re.MULTILINE)
 
 
 def test_run_incomplete_exit_code_1(frames: dict[str, Path], env: list[str], capsys: pytest.CaptureFixture[str]) -> None:
     code = cli.main(["run", "--model", "CAM_A", "--serial", "S002", "--normal", str(frames["normal"]), *env])
     out = capsys.readouterr().out
     assert code == 1 and "Verdict: INCOMPLETE" in out
-    assert re.search(r"^pixels_dead\s+SKIPPED .*required frame missing", out, re.M)
+    assert re.search(r"^pixels_dead\s+SKIPPED .*required frame missing", out, re.MULTILINE)
 
 
 def test_run_colors_when_stdout_is_a_tty(
@@ -187,8 +187,8 @@ def test_batch_uses_filename_stem_as_serial(
     (folder / "notes.txt").write_text("ignored", encoding="utf-8")
     assert cli.main(["batch", "--dir", str(folder), *mini_config, *env]) == 1
     out = capsys.readouterr().out
-    assert re.search(r"^S001\.png\s+S001\s+PASS", out, re.M)
-    assert re.search(r"^S002\.png\s+S002\s+FAIL\s+brightness", out, re.M)
+    assert re.search(r"^S001\.png\s+S001\s+PASS", out, re.MULTILINE)
+    assert re.search(r"^S002\.png\s+S002\s+FAIL\s+brightness", out, re.MULTILINE)
     assert "notes.txt" not in out and "2 images: 1 PASS, 1 not PASS, 0 errors" in out
     conn = db.init_db(tmp_path / "t.db")
     assert [db.find_by_serial(conn, s)[0]["verdict"] for s in ("S001", "S002")] == [PASS, FAIL]
@@ -301,10 +301,10 @@ def test_stats_tables(tmp_path: Path, env: list[str], capsys: pytest.CaptureFixt
     conn.close()
     assert cli.main(["stats", "--from", "2026-11-01", "--to", "2026-11-30", *env]) == 0
     out = capsys.readouterr().out
-    assert re.search(r"^2026-11-14\s+3\s+2\s+1\s+0\s+66\.7", out, re.M)
-    assert re.search(r"^2026-11-15\s+1\s+0\s+1\s+0\s+0\.0", out, re.M)
-    assert re.search(r"^sharpness\s+2\s+66\.7\s+66\.7", out, re.M)
-    assert re.search(r"^blemish\s+1\s+33\.3\s+100\.0", out, re.M)
+    assert re.search(r"^2026-11-14\s+3\s+2\s+1\s+0\s+66\.7", out, re.MULTILINE)
+    assert re.search(r"^2026-11-15\s+1\s+0\s+1\s+0\s+0\.0", out, re.MULTILINE)
+    assert re.search(r"^sharpness\s+2\s+66\.7\s+66\.7", out, re.MULTILINE)
+    assert re.search(r"^blemish\s+1\s+33\.3\s+100\.0", out, re.MULTILINE)
     assert cli.main(["stats", "--from", "2026-11-15", "--to", "2026-11-15", *env]) == 0
     only_15 = capsys.readouterr().out
     assert "2026-11-14" not in only_15 and "sharpness" in only_15
@@ -398,12 +398,122 @@ def test_module_entry_point_via_subprocess(tmp_path: Path) -> None:
     env = {**os.environ, "PYTHONPATH": str(ROOT / "src"), "NO_COLOR": "1"}
     common = ["--db", str(tmp_path / "s.db"), "--log-file", str(tmp_path / "s.log")]
     init = subprocess.run([sys.executable, "-m", "camqc.cli", "init-db", *common],
-                          capture_output=True, text=True, cwd=tmp_path, env=env, timeout=120)
+                          capture_output=True, text=True, cwd=tmp_path, env=env, timeout=120, check=False)
     assert init.returncode == 0
     stats = subprocess.run([sys.executable, "-m", "camqc.cli", "stats", *common],
-                           capture_output=True, text=True, cwd=tmp_path, env=env, timeout=120)
+                           capture_output=True, text=True, cwd=tmp_path, env=env, timeout=120, check=False)
     assert stats.returncode == 0 and "No runs in the selected range" in stats.stdout
     bad = subprocess.run([sys.executable, "-m", "camqc.cli", "run", "--model", "CAM_A", "--serial", "S",
                           "--normal", "missing.png", *common],
-                         capture_output=True, text=True, cwd=tmp_path, env=env, timeout=120)
+                         capture_output=True, text=True, cwd=tmp_path, env=env, timeout=120, check=False)
     assert bad.returncode == 2 and "image not found" in bad.stderr
+
+
+# --- report ----------------------------------------------------------------------------
+
+
+def run_unit(tmp_path: Path, env: list[str], mini_config: list[str], serial: str, value: int = 128, *extra: str) -> None:
+    image = write_png(tmp_path / f"{serial}.png", solid(value))
+    assert cli.main(["run", "--serial", serial, "--normal", str(image), *mini_config, *env, *extra]) in (0, 1)
+
+
+def stored_images(tmp_path: Path, run_id: int) -> dict[str, np.ndarray]:
+    conn = db.init_db(tmp_path / "t.db")
+    try:
+        return db.get_run_images(conn, run_id)
+    finally:
+        conn.close()
+
+
+def test_run_stores_its_input_images_by_default(tmp_path: Path, env: list[str], mini_config: list[str]) -> None:
+    run_unit(tmp_path, env, mini_config, "IMG1")
+    assert set(stored_images(tmp_path, 1)) == {"normal"}
+
+
+def test_no_images_flag_keeps_the_database_small(tmp_path: Path, env: list[str], mini_config: list[str]) -> None:
+    run_unit(tmp_path, env, mini_config, "IMG2", 128, "--no-images")
+    assert stored_images(tmp_path, 1) == {}
+
+
+def test_batch_stores_images_too(tmp_path: Path, env: list[str], mini_config: list[str]) -> None:
+    write_png(tmp_path / "d" / "B1.png", solid(128))
+    write_png(tmp_path / "d" / "B2.png", solid(130))
+    assert cli.main(["batch", "--dir", str(tmp_path / "d"), *mini_config, *env]) == 0
+    assert set(stored_images(tmp_path, 1)) == set(stored_images(tmp_path, 2)) == {"normal"}
+
+
+def test_report_html_for_a_stored_run(
+    tmp_path: Path, env: list[str], mini_config: list[str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    run_unit(tmp_path, env, mini_config, "SN-RPT")
+    capsys.readouterr()
+    out = tmp_path / "reports" / "r.html"
+    assert cli.main(["report", "--run-id", "1", "--out", str(out), *env]) == 0
+    assert f"Report written: {out}" in capsys.readouterr().out
+    text = out.read_text(encoding="utf-8")
+    assert "SN-RPT" in text and "<td>brightness</td>" in text and "data:image/jpeg;base64," in text
+    assert ">PASS</span>" in text
+
+
+def test_report_without_images_says_so(tmp_path: Path, env: list[str], mini_config: list[str]) -> None:
+    run_unit(tmp_path, env, mini_config, "NOIMG", 128, "--no-images")
+    out = tmp_path / "r.html"
+    assert cli.main(["report", "--run-id", "1", "--out", str(out), *env]) == 0
+    text = out.read_text(encoding="utf-8")
+    assert "NOIMG" in text and "No input image was stored for this run." in text and "data:image" not in text
+
+
+def test_report_default_file_names(tmp_path: Path, env: list[str], mini_config: list[str], monkeypatch: pytest.MonkeyPatch) -> None:
+    run_unit(tmp_path, env, mini_config, "DEF1")
+    monkeypatch.chdir(tmp_path)
+    assert cli.main(["report", "--run-id", "1", *env]) == 0
+    assert "DEF1" in (tmp_path / "report_run1.html").read_text(encoding="utf-8")
+    assert cli.main(["report", *env]) == 0
+    assert "DEF1" in (tmp_path / "runs.csv").read_text(encoding="utf-8-sig")
+
+
+def test_report_csv_for_a_date_range(
+    tmp_path: Path, env: list[str], mini_config: list[str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    run_unit(tmp_path, env, mini_config, "CSV1")
+    run_unit(tmp_path, env, mini_config, "CSV2", 20)
+    capsys.readouterr()
+    out = tmp_path / "runs.csv"
+    assert cli.main(["report", "--out", str(out), *env]) == 0
+    assert "2 rows written" in capsys.readouterr().out
+    rows = out.read_text(encoding="utf-8-sig").splitlines()
+    assert rows[0].startswith("run_id,serial,model") and len(rows) == 3
+    assert [r.split(",")[1] for r in rows[1:]] == ["CSV1", "CSV2"] and ",FAIL," in rows[2]
+    assert cli.main(["report", "--from", "2000-01-01", "--to", "2000-01-31", "--out", str(out), *env]) == 0
+    assert "0 rows written" in capsys.readouterr().out and len(out.read_text(encoding="utf-8-sig").splitlines()) == 1
+
+
+@pytest.mark.parametrize(
+    ("args", "message"),
+    [
+        (["--run-id", "999"], "run #999 not found"),
+        (["--run-id", "1", "--from", "2026-01-01"], "cannot be combined"),
+        (["--run-id", "1", "--to", "2026-01-01"], "cannot be combined"),
+    ],
+)
+def test_report_errors_exit_2(
+    args: list[str], message: str, tmp_path: Path, env: list[str], mini_config: list[str],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    run_unit(tmp_path, env, mini_config, "ERR1")
+    capsys.readouterr()
+    out = tmp_path / "x.html"
+    assert cli.main(["report", *args, "--out", str(out), *env]) == 2
+    assert message in capsys.readouterr().err and not out.exists()
+
+
+def test_report_needs_an_existing_database_and_a_writable_target(
+    tmp_path: Path, env: list[str], mini_config: list[str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    log = ["--log-file", str(tmp_path / "l.log")]
+    assert cli.main(["report", "--run-id", "1", "--db", str(tmp_path / "missing.db"), *log]) == 2
+    assert "database not found" in capsys.readouterr().err and not (tmp_path / "missing.db").exists()
+    run_unit(tmp_path, env, mini_config, "W1")
+    capsys.readouterr()
+    assert cli.main(["report", "--run-id", "1", "--out", str(tmp_path), *env]) == 2  # a directory is not a file
+    assert "cannot write" in capsys.readouterr().err

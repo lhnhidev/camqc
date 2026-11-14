@@ -7,6 +7,7 @@ Commands::
     camqc batch --dir samples/ --model CAM_A --db camqc.db
     camqc history --serial S001
     camqc stats --from 2026-11-01 --to 2026-11-30
+    camqc report --run-id 12 --out report.html      (or: camqc report --from ... --to ... --out runs.csv)
 
 Exit codes: ``0`` PASS (and successful queries), ``1`` FAIL or INCOMPLETE, ``2`` errors
 (bad arguments, missing files, invalid config, database problems).
@@ -28,7 +29,7 @@ from typing import Any
 import cv2
 import numpy as np
 
-from camqc import db
+from camqc import db, report
 from camqc.checks.base import format_limits  # noqa: F401 - re-exported for the GUI
 from camqc.pipeline import (
     FRAME_TYPES,
@@ -196,7 +197,10 @@ def load_config_for(args: argparse.Namespace) -> Config:
 
 
 def open_existing_db(path: str | Path) -> sqlite3.Connection:
-    """Open a database for a read-only command without creating it as a side effect.
+    """Open an existing database for a query/report command; a missing file is an error.
+
+    The schema is still brought up to date (``init_db`` creates missing tables), which is
+    how an older database gains new tables, but a mistyped ``--db`` never creates a new file.
 
     Raises:
         CliError: If the file does not exist (usually a mistyped ``--db``).
@@ -245,10 +249,13 @@ def execute(
     serial: str,
     station: str,
     frames: Mapping[str, np.ndarray],
+    store_images: bool = True,
 ) -> tuple[int, RunResult]:
-    """Run the pipeline, store the run, and return ``(run_id, result)``."""
+    """Run the pipeline, store the run (and, unless disabled, its input images), and return ``(run_id, result)``."""
     result = run_pipeline(model, frames, config)
-    run_id = db.save_run(conn, db.RunInput(serial, model, station, datetime.now()), result)
+    run_id = db.save_run(
+        conn, db.RunInput(serial, model, station, datetime.now()), result, frames if store_images else None
+    )
     logger.info("run %d serial=%s model=%s verdict=%s failed=%s",
                 run_id, serial, model, result.verdict, list(result.failed_checks))
     return run_id, result
@@ -276,7 +283,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     colorize = use_color(sys.stdout)
     conn = db.init_db(args.db)
     try:
-        run_id, result = execute(conn, config, args.model, args.serial, args.station, frames)
+        run_id, result = execute(conn, config, args.model, args.serial, args.station, frames, not args.no_images)
     finally:
         conn.close()
     emit(f"Serial {args.serial}  Model {args.model}  Station {args.station}  "
@@ -308,7 +315,7 @@ def cmd_batch(args: argparse.Namespace) -> int:
         for path in files:
             try:
                 frames = {args.frame: load_image(path)}
-                run_id, result = execute(conn, config, args.model, path.stem, args.station, frames)
+                run_id, result = execute(conn, config, args.model, path.stem, args.station, frames, not args.no_images)
             except (CliError, ValueError) as exc:  # bad image, or a serial the database rejects
                 logger.warning("batch %s: %s", path, exc)
                 fail(str(exc))
@@ -384,6 +391,29 @@ def cmd_stats(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def cmd_report(args: argparse.Namespace) -> int:
+    """``report``: write an HTML report for one run (``--run-id``) or a CSV of runs (``--from``/``--to``)."""
+    csv_mode = args.run_id is None
+    if not csv_mode and (args.date_from or args.date_to):
+        raise CliError("--run-id (HTML report) cannot be combined with --from/--to (CSV export)")
+    out = Path(args.out or ("runs.csv" if csv_mode else f"report_run{args.run_id}.html"))
+    conn = open_existing_db(args.db)
+    try:
+        if csv_mode:
+            rows = report.export_csv(conn, args.date_from, args.date_to, out)
+            emit(f"{rows} rows written: {out}")
+        else:
+            report.export_html(conn, args.run_id, out)
+            emit(f"Report written: {out}")
+    except report.RunNotFoundError as exc:
+        raise CliError(str(exc)) from None
+    except OSError as exc:
+        raise CliError(f"cannot write {out}: {exc.strerror or exc}") from exc
+    finally:
+        conn.close()
+    return EXIT_OK
+
+
 # --- parser / main ---------------------------------------------------------------------
 
 
@@ -400,6 +430,8 @@ def build_parser() -> argparse.ArgumentParser:
     testing.add_argument("--model", required=True, help="camera model from the config, e.g. CAM_A")
     testing.add_argument("--station", default="UNKNOWN", help="test station id (default: UNKNOWN)")
     testing.add_argument("--config", type=Path, help="models YAML (default: config/models.yaml)")
+    testing.add_argument("--no-images", action="store_true",
+                         help="do not store the input images (smaller database; reports then show no image)")
 
     parser = argparse.ArgumentParser(prog="camqc", description="Camera module image quality checks.")
     sub = parser.add_subparsers(dest="command", required=True, metavar="command")
@@ -428,6 +460,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--from", dest="date_from", type=parse_day, help="first day, YYYY-MM-DD")
     p.add_argument("--to", dest="date_to", type=parse_day, help="last day (inclusive), YYYY-MM-DD")
     p.set_defaults(func=cmd_stats)
+
+    p = sub.add_parser("report", parents=[storage], help="HTML report of one run, or CSV of runs")
+    p.add_argument("--run-id", type=int, help="write the HTML report of this run")
+    p.add_argument("--from", dest="date_from", type=parse_day, help="CSV: first day, YYYY-MM-DD")
+    p.add_argument("--to", dest="date_to", type=parse_day, help="CSV: last day (inclusive), YYYY-MM-DD")
+    p.add_argument("--out", type=Path, help="output file (default: report_run<ID>.html, or runs.csv)")
+    p.set_defaults(func=cmd_report)
     return parser
 
 
