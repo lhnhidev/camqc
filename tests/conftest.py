@@ -43,3 +43,12 @@ def make_sample() -> Callable[[str], np.ndarray]:
         return cache[name]
 
     return make
+
+
+@pytest.fixture(scope="session")
+def qapp():  # noqa: ANN201 - yields a QApplication; PySide6 is imported lazily
+    """The single QApplication for GUI tests (skips them if PySide6 is missing)."""
+    pytest.importorskip("PySide6")
+    from PySide6.QtWidgets import QApplication
+
+    yield QApplication.instance() or QApplication([])

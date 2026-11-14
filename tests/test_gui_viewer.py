@@ -1,0 +1,179 @@
+"""Tests for overlay drawing (viewer.py) and the background workers (workers.py)."""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import pytest
+
+pytest.importorskip("PySide6")
+
+from PySide6.QtCore import Qt  # noqa: E402
+from PySide6.QtGui import QColor, QPixmap  # noqa: E402
+from PySide6.QtWidgets import QApplication  # noqa: E402
+
+from camqc.checks.base import make_result  # noqa: E402
+from camqc.gui import viewer  # noqa: E402
+from camqc.gui.viewer import ScaledImageLabel, StyledShape, overlay_shapes  # noqa: E402
+from camqc.pipeline import (  # noqa: E402
+    ERROR,
+    FAIL,
+    PASS,
+    SKIPPED,
+    CheckOutcome,
+    Config,
+    RunResult,
+    parse_config,
+)
+from gui_support import png  # noqa: E402
+
+RECT = {"type": "rect", "x": 100, "y": 40, "w": 200, "h": 120}
+CIRCLE = {"type": "circle", "x": 700, "y": 240, "r": 100}
+
+
+def colour_at(label: ScaledImageLabel, x: int, y: int) -> QColor:
+    return label.pixmap().toImage().pixelColor(x, y)
+
+
+def is_red(c: QColor) -> bool:
+    return c.red() > 200 and c.green() < 90 and c.blue() < 90
+
+
+def is_yellow(c: QColor) -> bool:
+    return c.red() > 200 and c.green() > 160 and c.blue() < 90
+
+
+def is_black(c: QColor) -> bool:
+    return c.red() < 40 and c.green() < 40 and c.blue() < 40
+
+
+def black_label(qapp: QApplication, label_size: tuple[int, int], image_size: tuple[int, int] = (960, 480)) -> ScaledImageLabel:
+    label = ScaledImageLabel()
+    label.show()  # resize events are only delivered to visible widgets
+    label.resize(*label_size)
+    pixmap = QPixmap(*image_size)
+    pixmap.fill(Qt.GlobalColor.black)
+    label.set_image(pixmap)
+    return label
+
+
+def test_overlays_are_scaled_with_the_image(qapp: QApplication) -> None:
+    label = black_label(qapp, (480, 240))  # 960x480 image shown at scale 0.5
+    label.set_overlays([StyledShape(RECT, "#ff0000", 3), StyledShape(CIRCLE, "#ffd400", 3)])
+    QApplication.processEvents()
+    assert label.pixmap().size().width() == 480
+    assert is_red(colour_at(label, 50, 50))  # rect left edge: x 100 * 0.5
+    assert is_red(colour_at(label, 100, 20))  # rect top edge: y 40 * 0.5
+    assert is_red(colour_at(label, 150, 50))  # rect right edge: (100 + 200) * 0.5
+    assert is_black(colour_at(label, 100, 50))  # rect interior is not filled
+    assert is_black(colour_at(label, 120, 50)) and is_black(colour_at(label, 200, 120))  # nothing elsewhere
+    assert is_yellow(colour_at(label, 400, 120))  # circle rightmost point: (700 + 100) * 0.5, 240 * 0.5
+    assert is_yellow(colour_at(label, 300, 120))  # leftmost point
+    assert is_yellow(colour_at(label, 350, 70))  # top point
+    assert is_black(colour_at(label, 350, 120))  # center
+
+
+def test_overlays_follow_resizes_and_keep_line_width(qapp: QApplication) -> None:
+    label = black_label(qapp, (480, 240))
+    label.set_overlays([StyledShape(RECT, "#ff0000", 3)])
+    label.resize(960, 480)  # now scale 1.0
+    QApplication.processEvents()
+    assert label.pixmap().width() == 960
+    assert is_red(colour_at(label, 100, 100)) and is_black(colour_at(label, 50, 100))
+    # the pen stays ~3 screen pixels wide at any zoom (it is not scaled with the image)
+    assert is_red(colour_at(label, 99, 100))
+    assert is_black(colour_at(label, 97, 100)) and is_black(colour_at(label, 103, 100))
+
+
+def test_aspect_ratio_uses_separate_x_and_y_scales(qapp: QApplication) -> None:
+    label = black_label(qapp, (400, 400), image_size=(800, 600))  # scaled to 400x300 (0.5 both ways)
+    label.set_overlays([StyledShape({"type": "rect", "x": 200, "y": 100, "w": 400, "h": 300}, "#ff0000", 3)])
+    QApplication.processEvents()
+    assert (label.pixmap().width(), label.pixmap().height()) == (400, 300)
+    assert is_red(colour_at(label, 100, 100)) and is_red(colour_at(label, 200, 50))  # left x=100, top y=50
+    assert is_red(colour_at(label, 300, 100)) and is_red(colour_at(label, 200, 200))  # right x=300, bottom y=200
+
+
+def test_circle_centers_are_pixel_indices_so_they_are_drawn_at_the_pixel_middle(qapp: QApplication) -> None:
+    pixmap = QPixmap(50, 50)
+    pixmap.fill(Qt.GlobalColor.black)
+    circle = {"type": "circle", "x": 2, "y": 2, "r": 1}  # the pixel (2, 2): its middle is (2.5, 2.5)
+    viewer.draw_shapes(pixmap, [StyledShape(circle, "#ff0000", 3)], 10, 10)
+    image = pixmap.toImage()
+    assert is_red(image.pixelColor(35, 25)) and is_red(image.pixelColor(15, 25))  # (2.5 +- 1) * 10 = 35 / 15
+    assert is_black(image.pixelColor(25, 25))  # centered on 25, not on 20
+
+
+def test_drawing_never_modifies_the_source_image(qapp: QApplication) -> None:
+    label = black_label(qapp, (480, 240))
+    source = label._source
+    assert source is not None
+    label.set_overlays([StyledShape(RECT, "#ff0000", 3)])
+    assert is_black(source.toImage().pixelColor(100, 100))  # the original pixmap is untouched
+
+
+def test_set_image_clears_overlays_and_empty_list_removes_them(qapp: QApplication) -> None:
+    label = black_label(qapp, (480, 240))
+    label.set_overlays([StyledShape(RECT, "#ff0000", 3)])
+    assert len(label.shapes) == 1
+    label.set_overlays([])
+    assert label.shapes == [] and is_black(colour_at(label, 50, 50))
+    label.set_overlays([StyledShape(RECT, "#ff0000", 3)])
+    pixmap = QPixmap(960, 480)
+    pixmap.fill(Qt.GlobalColor.black)
+    label.set_image(pixmap)
+    assert label.shapes == [] and is_black(colour_at(label, 50, 50))
+
+
+def test_unknown_shape_types_and_no_image_are_ignored(qapp: QApplication) -> None:
+    label = black_label(qapp, (480, 240))
+    label.set_overlays([StyledShape({"type": "polygon", "points": []}, "#ff0000", 3)])
+    assert is_black(colour_at(label, 50, 50))
+    empty = ScaledImageLabel()
+    empty.set_overlays([StyledShape(RECT, "#ff0000", 3)])  # no image yet: nothing to draw on
+    assert empty.pixmap().isNull() and empty.text() == "No image"
+
+
+def outcome(name: str, status: str, frame: str | None, overlay: list[dict[str, Any]] | None = None) -> CheckOutcome:
+    if status in (PASS, FAIL):
+        return CheckOutcome(name, status, make_result(name, 1.0, "u", None, None, None, overlay), None, frame, 1.0)
+    return CheckOutcome(name, status, None, "boom", frame, 1.0)
+
+
+@pytest.fixture
+def run() -> RunResult:
+    circle = {"type": "circle", "x": 5, "y": 6, "r": 7}
+    outcomes = (
+        outcome("a", FAIL, "dark", [circle]),
+        outcome("b", PASS, "dark", [RECT, RECT]),
+        outcome("c", PASS, "flat", [CIRCLE]),
+        outcome("d", PASS, "dark", []),
+        outcome("e", SKIPPED, None),
+        outcome("f", ERROR, "dark"),
+    )
+    return RunResult("FAIL", outcomes, ("a",), 1.0)
+
+
+def test_overlay_shapes_default_shows_all_checks_of_the_frame_thinly(run: RunResult) -> None:
+    shapes = overlay_shapes(run, "dark")
+    assert [s.shape["type"] for s in shapes] == ["circle", "rect", "rect"]
+    assert [s.color for s in shapes] == [viewer.OVERLAY_COLORS[FAIL], viewer.OVERLAY_COLORS[PASS], viewer.OVERLAY_COLORS[PASS]]
+    assert {s.width for s in shapes} == {viewer.THIN_WIDTH}
+    assert [s.shape for s in overlay_shapes(run, "flat")] == [CIRCLE]
+    assert overlay_shapes(run, "white") == []
+
+
+def test_overlay_shapes_selected_check_only_and_highlighted(run: RunResult) -> None:
+    shapes = overlay_shapes(run, "dark", selected="b")
+    assert [s.shape for s in shapes] == [RECT, RECT]
+    assert {(s.color, s.width) for s in shapes} == {(viewer.HIGHLIGHT_COLOR, viewer.HIGHLIGHT_WIDTH)}
+    assert overlay_shapes(run, "dark", selected="a")[0].shape["type"] == "circle"
+
+
+def test_overlay_shapes_selection_edge_cases(run: RunResult) -> None:
+    assert overlay_shapes(run, "dark", selected="d") == []  # check without overlay
+    assert overlay_shapes(run, "dark", selected="c") == []  # check used another frame
+    assert overlay_shapes(run, "dark", selected="e") == overlay_shapes(run, "dark", selected="f") == []  # no result
+    assert overlay_shapes(run, "dark", selected="nope") == []
