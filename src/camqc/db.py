@@ -15,18 +15,23 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import cv2
 import numpy as np
 
 from camqc.pipeline import CheckOutcome, RunResult
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+
+IMAGE_FORMAT = "jpg"  # run images are stored JPEG-compressed: ~0.3-1 MB per 1080p frame instead of ~4 MB
+IMAGE_JPEG_QUALITY = 90
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
@@ -48,6 +53,13 @@ CREATE TABLE IF NOT EXISTS results (
     high         REAL,
     status       TEXT NOT NULL,
     details_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS run_images (
+    run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    frame  TEXT NOT NULL,
+    format TEXT NOT NULL,
+    data   BLOB NOT NULL,
+    PRIMARY KEY (run_id, frame)
 );
 CREATE INDEX IF NOT EXISTS idx_runs_serial ON runs(serial);
 CREATE INDEX IF NOT EXISTS idx_runs_started_at ON runs(started_at);
@@ -122,6 +134,7 @@ def _result_row(run_id: int, outcome: CheckOutcome) -> tuple[Any, ...]:
         "frame": outcome.frame,
         "reason": outcome.reason,
         "details": res.details if res is not None else {},
+        "overlay": res.overlay if res is not None else [],
     }
     return (
         run_id,
@@ -160,14 +173,30 @@ def init_db(path: str | Path) -> sqlite3.Connection:
     return conn
 
 
-def save_run(conn: sqlite3.Connection, run_input: RunInput, run_result: RunResult) -> int:
-    """Store a run and all its check results in a single transaction.
+def _encode_image(image: np.ndarray) -> bytes:
+    """Return ``image`` JPEG-encoded (quality ``IMAGE_JPEG_QUALITY``)."""
+    ok, buffer = cv2.imencode(f".{IMAGE_FORMAT}", image, [cv2.IMWRITE_JPEG_QUALITY, IMAGE_JPEG_QUALITY])
+    if not ok:
+        raise ValueError("cannot encode the image")
+    return buffer.tobytes()
+
+
+def save_run(
+    conn: sqlite3.Connection,
+    run_input: RunInput,
+    run_result: RunResult,
+    frames: Mapping[str, np.ndarray] | None = None,
+) -> int:
+    """Store a run, its check results and (optionally) its input images in one transaction.
 
     Args:
         conn: Connection from :func:`init_db`.
         run_input: Serial, model, station and start time.
         run_result: Pipeline output; every check outcome (including SKIPPED and
-            ERROR) becomes a ``results`` row.
+            ERROR) becomes a ``results`` row, with its overlay shapes kept in
+            ``details_json`` so reports can redraw them.
+        frames: Optional ``{frame type: BGR image}``. Only frames that a check of this
+            run actually used are stored (JPEG), so unused images cost no space.
 
     Returns:
         The new ``runs.id``.
@@ -195,7 +224,7 @@ def save_run(conn: sqlite3.Connection, run_input: RunInput, run_result: RunResul
                 run_input.station,
                 _started_at_text(run_input.started_at),
                 run_result.verdict,
-                int(round(run_result.duration_ms)),
+                round(run_result.duration_ms),
             ),
         )
         run_id = int(cur.lastrowid)
@@ -203,6 +232,12 @@ def save_run(conn: sqlite3.Connection, run_input: RunInput, run_result: RunResul
             "INSERT INTO results (run_id, check_name, value, unit, low, high, status, details_json)"
             " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             [_result_row(run_id, o) for o in run_result.results],
+        )
+        used = {o.frame for o in run_result.results if o.frame}
+        conn.executemany(
+            "INSERT INTO run_images (run_id, frame, format, data) VALUES (?, ?, ?, ?)",
+            [(run_id, frame, IMAGE_FORMAT, _encode_image(image))
+             for frame, image in (frames or {}).items() if frame in used],
         )
     logger.info("saved run %d serial=%s verdict=%s", run_id, serial, run_result.verdict)
     return run_id
@@ -281,6 +316,48 @@ def search_runs(
         sql += " LIMIT ?"
         params.append(limit)
     return [dict(r) for r in conn.execute(sql, params).fetchall()]
+
+
+def export_rows(conn: sqlite3.Connection, date_from: DateLike, date_to: DateLike) -> Iterator[dict[str, Any]]:
+    """Yield one flat row per check result of every run in the day range (for CSV export).
+
+    Runs without any result row still yield one row (with empty check fields). Rows are
+    ordered by start time, run id and check, and streamed from the cursor.
+
+    Yields:
+        Dicts with the run columns, ``check_name``, ``value``, ``unit``, ``low``,
+        ``high``, ``status`` and ``reason`` (why a check failed, was skipped or errored).
+    """
+    clause, params = _range_clause(date_from, date_to)
+    cursor = conn.execute(
+        "SELECT runs.id AS run_id, runs.serial, runs.model, runs.station, runs.started_at,"
+        " runs.verdict, runs.duration_ms, results.check_name, results.value, results.unit,"
+        " results.low, results.high, results.status, results.details_json"
+        " FROM runs LEFT JOIN results ON results.run_id = runs.id WHERE 1 = 1" + clause +
+        " ORDER BY runs.started_at, runs.id, results.id",
+        params,
+    )
+    for row in cursor:
+        item = dict(row)
+        payload = json.loads(item.pop("details_json") or "{}")
+        item["reason"] = payload.get("reason") or payload.get("details", {}).get("reason", "")
+        yield item
+
+
+def get_run_images(conn: sqlite3.Connection, run_id: int) -> dict[str, np.ndarray]:
+    """Return the stored input images of a run as ``{frame type: BGR image}``.
+
+    Runs saved without images (or before images were stored) give an empty dict;
+    an image that cannot be decoded is skipped with a warning.
+    """
+    images: dict[str, np.ndarray] = {}
+    for row in conn.execute("SELECT frame, data FROM run_images WHERE run_id = ? ORDER BY frame", (run_id,)):
+        image = cv2.imdecode(np.frombuffer(row["data"], np.uint8), cv2.IMREAD_COLOR)
+        if image is None:
+            logger.warning("run %s: stored %s image cannot be decoded", run_id, row["frame"])
+            continue
+        images[row["frame"]] = image
+    return images
 
 
 def get_run_detail(conn: sqlite3.Connection, run_id: int) -> dict[str, Any] | None:

@@ -13,7 +13,15 @@ import pytest
 from camqc import db
 from camqc.checks.base import make_result
 from camqc.db import RunInput
-from camqc.pipeline import ERROR, FAIL, INCOMPLETE, PASS, SKIPPED, CheckOutcome, RunResult
+from camqc.pipeline import (
+    ERROR,
+    FAIL,
+    INCOMPLETE,
+    PASS,
+    SKIPPED,
+    CheckOutcome,
+    RunResult,
+)
 
 
 @pytest.fixture
@@ -284,3 +292,114 @@ def test_search_runs_combines_filters_and_limit(seeded: sqlite3.Connection) -> N
     assert serials(db.search_runs(seeded, None, None, None, limit=2)) == ["C1", "B2"]
     assert db.search_runs(seeded, "x'; DROP TABLE runs; --") == []
     assert len(db.search_runs(seeded)) == 6  # the table is still there
+
+
+# --- run images, overlays, CSV rows -----------------------------------------------------------
+
+
+def smooth_image(value: int = 120, shape: tuple[int, int] = (60, 80)) -> np.ndarray:
+    ramp = np.linspace(value - 20, value + 20, shape[1], dtype=np.float32)
+    return np.repeat(np.tile(ramp, (shape[0], 1))[..., None], 3, axis=2).astype(np.uint8)
+
+
+def table_count(conn: sqlite3.Connection, table: str) -> int:
+    return int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+
+
+def test_save_run_stores_only_the_frames_a_check_used(conn: sqlite3.Connection) -> None:
+    frames = {"flat": smooth_image(120), "normal": smooth_image(60), "dark": smooth_image(10)}
+    run_id = db.save_run(conn, run_input("IMG1", at(14)), PASSING, frames)  # PASSING's checks used "flat"
+    images = db.get_run_images(conn, run_id)
+    assert set(images) == {"flat"} and table_count(conn, "run_images") == 1
+    assert images["flat"].shape == (60, 80, 3)
+    assert np.abs(images["flat"].astype(int) - frames["flat"].astype(int)).mean() < 3  # JPEG is nearly lossless here
+    row = conn.execute("SELECT format FROM run_images WHERE run_id = ?", (run_id,)).fetchone()
+    assert row["format"] == db.IMAGE_FORMAT
+
+
+def test_gray_frames_come_back_as_three_channel_images(conn: sqlite3.Connection) -> None:
+    run_id = db.save_run(conn, run_input("GRAY", at(14)), PASSING, {"flat": np.full((20, 30), 90, np.uint8)})
+    assert db.get_run_images(conn, run_id)["flat"].shape == (20, 30, 3)
+
+
+def test_runs_without_frames_have_no_images(conn: sqlite3.Connection) -> None:
+    run_id = db.save_run(conn, run_input("NOIMG", at(14)), PASSING)
+    assert db.get_run_images(conn, run_id) == {} and table_count(conn, "run_images") == 0
+    assert db.get_run_images(conn, 9999) == {}
+    assert db.get_run_images(conn, db.save_run(conn, run_input("E", at(14)), PASSING, {})) == {}
+
+
+def test_overlays_are_stored_with_the_results(conn: sqlite3.Connection) -> None:
+    circle = {"type": "circle", "x": np.int64(5), "y": 6, "r": 7.5}
+    res = make_result("blemish", 1, "count", None, 0, {}, [circle, {"type": "rect", "x": 1, "y": 2, "w": 3, "h": 4}])
+    result = run_result(FAIL, CheckOutcome("blemish", FAIL, res, None, "flat", 1.0), outcome("brightness"))
+    detail = db.get_run_detail(conn, db.save_run(conn, run_input("OV", at(14)), result))
+    blemish, brightness = detail["results"]  # type: ignore[index]
+    assert blemish["overlay"] == [{"type": "circle", "x": 5, "y": 6, "r": 7.5}, {"type": "rect", "x": 1, "y": 2, "w": 3, "h": 4}]
+    assert brightness["overlay"] == []
+
+
+def test_a_failing_image_encode_rolls_the_whole_run_back(conn: sqlite3.Connection) -> None:
+    with pytest.raises(Exception):  # noqa: B017 - cv2.error for an empty image
+        db.save_run(conn, run_input("BAD", at(14)), PASSING, {"flat": np.zeros((0, 0, 3), np.uint8)})
+    assert [table_count(conn, t) for t in ("runs", "results", "run_images")] == [0, 0, 0]
+    assert db.save_run(conn, run_input("BAD", at(14)), PASSING, {"flat": smooth_image()}) > 0
+
+
+def test_deleting_a_run_deletes_its_images(conn: sqlite3.Connection) -> None:
+    run_id = db.save_run(conn, run_input("DEL", at(14)), PASSING, {"flat": smooth_image()})
+    assert table_count(conn, "run_images") == 1
+    conn.execute("DELETE FROM runs WHERE id = ?", (run_id,))
+    conn.commit()
+    assert table_count(conn, "run_images") == 0 and table_count(conn, "results") == 0
+
+
+OLD_SCHEMA = """
+CREATE TABLE runs (id INTEGER PRIMARY KEY, serial TEXT NOT NULL, model TEXT NOT NULL, station TEXT NOT NULL,
+                   started_at TEXT NOT NULL, verdict TEXT NOT NULL, duration_ms INTEGER NOT NULL);
+CREATE TABLE results (id INTEGER PRIMARY KEY, run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+                      check_name TEXT NOT NULL, value REAL, unit TEXT, low REAL, high REAL, status TEXT NOT NULL,
+                      details_json TEXT NOT NULL);
+PRAGMA user_version = 1;
+INSERT INTO runs VALUES (1, 'OLD-1', 'CAM_A', 'ST1', '2026-11-01T08:00:00', 'FAIL', 100);
+INSERT INTO results VALUES (1, 1, 'sharpness', 3.0, 'score', 100.0, NULL, 'FAIL',
+                            '{"frame": "normal", "reason": null, "details": {"reason": "too soft"}}');
+"""
+
+
+def test_an_older_database_is_upgraded_in_place(tmp_path: Path) -> None:
+    path = tmp_path / "old.db"
+    old = sqlite3.connect(path)
+    old.executescript(OLD_SCHEMA)
+    old.close()
+    conn = db.init_db(path)
+    try:
+        tables = {r["name"] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        assert "run_images" in tables and conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
+        assert serials(db.find_by_serial(conn, "OLD-1")) == ["OLD-1"]  # old data is intact
+        assert db.get_run_images(conn, 1) == {}
+        detail = db.get_run_detail(conn, 1)
+        assert detail["results"][0]["details"] == {"reason": "too soft"} and "overlay" not in detail["results"][0]  # type: ignore[index]
+        assert next(db.export_rows(conn, None, None))["reason"] == "too soft"
+    finally:
+        conn.close()
+
+
+def test_export_rows_are_flat_ordered_and_carry_reasons(seeded: sqlite3.Connection) -> None:
+    rows = list(db.export_rows(seeded, None, None))
+    assert len(rows) == 12 and [r["run_id"] for r in rows] == sorted(r["run_id"] for r in rows)
+    first = rows[0]
+    assert (first["serial"], first["check_name"], first["status"], first["unit"]) == ("A1", "brightness", "PASS", "u")
+    assert set(first) == {"run_id", "serial", "model", "station", "started_at", "verdict", "duration_ms",
+                          "check_name", "value", "unit", "low", "high", "status", "reason"}
+    by_check = {(r["serial"], r["check_name"]): r for r in rows}
+    assert by_check[("A2", "blemish")]["reason"] == ""  # seeded fails carry no details reason in test_db's helper
+    assert by_check[("B2", "pixels_dead")]["reason"] == "required frame missing"
+    assert by_check[("B2", "pixels_dead")]["value"] is None
+    assert [r["serial"] for r in db.export_rows(seeded, "2026-11-16", None)] == ["C1", "C1"]
+
+
+def test_export_rows_include_runs_without_results(conn: sqlite3.Connection) -> None:
+    db.save_run(conn, run_input("EMPTY", at(14)), RunResult("PASS", (), (), 1.0))
+    (row,) = db.export_rows(conn, None, None)
+    assert row["serial"] == "EMPTY" and row["check_name"] is None and row["reason"] == ""
