@@ -452,3 +452,59 @@ class TestTab(QWidget):
             return False
         QCoreApplication.sendPostedEvents()  # run the queued _on_finished (DB save) before exiting
         return True
+
+
+# --- main window -----------------------------------------------------------------------
+
+
+class MainWindow(QMainWindow):
+    """Top-level window with *Test*, *History* and *Statistics* tabs."""
+
+    def __init__(self, config_path: str | Path | None = None, db_path: str | Path = DEFAULT_DB) -> None:
+        super().__init__()
+        self.setWindowTitle("CamQC")
+        self.resize(1280, 800)
+        config: Config | None = None
+        error = ""
+        try:
+            config = load_config(config_path or default_config_path())
+        except ConfigError as exc:
+            logger.error("%s", exc)
+            error = f"Configuration error: {exc}"
+        self.test_tab = TestTab(config, db_path, error)
+        self.tabs = QTabWidget()
+        self.tabs.addTab(self.test_tab, "Test")
+        self.tabs.addTab(self._placeholder("History"), "History")
+        self.tabs.addTab(self._placeholder("Statistics"), "Statistics")
+        self.setCentralWidget(self.tabs)
+
+    @staticmethod
+    def _placeholder(name: str) -> QWidget:
+        label = QLabel(f"{name} - coming soon")
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        label.setStyleSheet("color: #808080; font-size: 18pt;")
+        return label
+
+    def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt override
+        """Let a running test finish (and be saved) before the window and its thread go away."""
+        if not self.test_tab.shutdown():
+            self.test_tab.show_message("A test is still running - wait for it to finish.", error=True)
+            event.ignore()
+            return
+        super().closeEvent(event)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Start the desktop application (the ``camqc-gui`` entry point)."""
+    handler = setup_logging(DEFAULT_LOG, verbose=False)
+    try:
+        app = QApplication.instance() or QApplication(list(argv if argv is not None else sys.argv))
+        window = MainWindow()
+        window.show()
+        return int(app.exec())
+    finally:
+        teardown_logging(handler)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

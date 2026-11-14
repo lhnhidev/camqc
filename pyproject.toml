@@ -22,6 +22,9 @@ dev = ["pytest>=8.0"]
 [project.scripts]
 camqc = "camqc.cli:main"
 
+[project.gui-scripts]
+camqc-gui = "camqc.gui.main_window:main"
+
 [tool.setuptools.packages.find]
 where = ["src"]
 
