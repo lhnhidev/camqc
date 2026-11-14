@@ -10,6 +10,7 @@ GUI thread because sqlite3 connections must not cross threads.
 from __future__ import annotations
 
 import logging
+import re
 import sqlite3
 import sys
 from collections.abc import Mapping, Sequence
@@ -18,7 +19,15 @@ from datetime import datetime
 from pathlib import Path
 
 import numpy as np
-from PySide6.QtCore import QCoreApplication, QObject, Qt, QThread, Signal, SignalInstance, Slot
+from PySide6.QtCore import (
+    QCoreApplication,
+    QObject,
+    Qt,
+    QThread,
+    Signal,
+    SignalInstance,
+    Slot,
+)
 from PySide6.QtGui import QBrush, QCloseEvent, QColor, QFont, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -41,7 +50,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from camqc import db
+from camqc import db, report
 from camqc.cli import (
     DEFAULT_DB,
     DEFAULT_LOG,
@@ -74,6 +83,12 @@ FRAME_BUTTON_ORDER = ("normal", "dark", "white", "flat")  # flat last: only some
 
 SHUTDOWN_WAIT_MS = 30_000  # how long closing the window waits for a running job
 TABLE_HEADERS = ("Check", "Value", "Unit", "Limits", "Status")
+
+
+def report_filename(serial: str, run_id: int) -> str:
+    """Return a safe default file name such as ``report_SN-001_run7.html``."""
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", serial).strip("_") or "unit"
+    return f"report_{safe}_run{run_id}.html"
 
 
 # --- helpers ---------------------------------------------------------------------------
@@ -130,6 +145,9 @@ class TestTab(QWidget):
         self._worker: QObject | None = None
         self._pending: tuple[str, str, str] | None = None  # (model, serial, station) of the active run
         self._run_pixmaps: dict[str, QPixmap] = {}  # snapshot taken when a run starts
+        self._run_frames: dict[str, np.ndarray] = {}  # the run's input images, stored with the run
+        self._last_run_id: int | None = None  # the saved run whose result is shown (for the report)
+        self._last_serial = ""
         self._review_pixmaps: dict[str, QPixmap] = {}  # images that belong to the shown result
         self._last_result: RunResult | None = None
         self._viewer_frame: str | None = None  # frame type shown in the viewer
@@ -225,6 +243,14 @@ class TestTab(QWidget):
         self.progress_bar.setVisible(False)
         self.cancel_button.setVisible(False)
 
+        self.export_button = QPushButton("Export report", objectName="export_button")
+        self.export_button.setToolTip("Save an HTML report (results, input images with overlays) of the shown run")
+        self.export_button.setEnabled(False)
+        self.export_button.clicked.connect(self.export_report)
+        export_row = QHBoxLayout()
+        export_row.addStretch(1)
+        export_row.addWidget(self.export_button)
+
         self.message_label = QLabel("", objectName="message_label", wordWrap=True)
 
         left = QVBoxLayout()
@@ -233,6 +259,7 @@ class TestTab(QWidget):
         right = QVBoxLayout()
         right.addWidget(self.verdict_label)
         right.addWidget(self.table, 1)
+        right.addLayout(export_row)
         right.addLayout(progress_row)
         right.addWidget(self.message_label)
         body = QHBoxLayout()
@@ -280,6 +307,7 @@ class TestTab(QWidget):
             button.setEnabled(enabled)
         for button in self.frame_buttons.values():
             button.setEnabled(not busy)
+        self.export_button.setEnabled(not busy and self._last_run_id is not None)
         folder_active = busy and isinstance(self._worker, FolderWorker)
         self.cancel_button.setVisible(folder_active)
         self.cancel_button.setEnabled(folder_active)
@@ -407,7 +435,9 @@ class TestTab(QWidget):
         model = self.model_combo.currentText()
         station = self.station_edit.text().strip() or DEFAULT_STATION
         self._pending = (model, serial, station)
+        self._last_run_id = None  # a failed pipeline must not leave the previous unit's report exportable
         self._run_pixmaps = dict(self._pixmaps)
+        self._run_frames = dict(self._frames)
         self.progress_bar.setVisible(False)
         self.show_message(f"Running {model} on {serial}...")
         self._style_verdict("RUNNING")
@@ -417,18 +447,23 @@ class TestTab(QWidget):
         worker.failed.connect(self._on_failed)
         self._launch(worker, worker.finished, worker.failed)
 
-    def _save_run(self, model: str, serial: str, station: str, result: RunResult) -> int | None:
-        """Save a run on the GUI thread; return its id, or ``None`` after showing the error."""
+    def _save_run(
+        self, model: str, serial: str, station: str, result: RunResult,
+        frames: Mapping[str, np.ndarray] | None = None,
+    ) -> int | None:
+        """Save a run (and its input images) on the GUI thread; return its id, or ``None`` after showing the error."""
+        self._last_run_id = None  # until this run is saved, there is nothing to report on
         try:
             conn = db.init_db(self._db_path)
             try:
-                run_id = db.save_run(conn, db.RunInput(serial, model, station, datetime.now()), result)
+                run_id = db.save_run(conn, db.RunInput(serial, model, station, datetime.now()), result, frames)
             finally:
                 conn.close()
         except (sqlite3.Error, OSError, ValueError) as exc:
             logger.exception("could not save run")
             self.show_message(f"Result NOT saved: {exc}", error=True)
             return None
+        self._last_run_id, self._last_serial = run_id, serial
         self.run_saved.emit(run_id)
         return run_id
 
@@ -441,7 +476,7 @@ class TestTab(QWidget):
             logger.error("run finished without pending run info; result not saved")
             return
         model, serial, station = self._pending
-        run_id = self._save_run(model, serial, station, result)
+        run_id = self._save_run(model, serial, station, result, self._run_frames)
         if run_id is not None:
             self.show_message(f"Saved as run #{run_id} ({result.duration_ms:.0f} ms)")
 
@@ -478,6 +513,7 @@ class TestTab(QWidget):
         model = self.model_combo.currentText()
         station = self.station_edit.text().strip() or DEFAULT_STATION
         self._folder = FolderRun(model, station, len(files))
+        self._last_run_id = None  # until an image of this batch is saved
         self.progress_bar.setRange(0, len(files))
         self.progress_bar.setValue(0)
         self.progress_bar.setVisible(True)
@@ -504,7 +540,7 @@ class TestTab(QWidget):
             return
         pixmaps = {frame: bgr_to_pixmap(image) for frame, image in frames.items()}
         self._show_run(result, pixmaps)
-        run_id = self._save_run(folder.model, Path(name).stem, folder.station, result)
+        run_id = self._save_run(folder.model, Path(name).stem, folder.station, result, frames)
         if run_id is None:
             folder.errors += 1
             return
@@ -539,6 +575,35 @@ class TestTab(QWidget):
             self._worker.cancel()
             self.cancel_button.setEnabled(False)
             self.show_message("Cancelling after the current image...")
+
+    # -- report --
+
+    @Slot()
+    def export_report(self) -> None:
+        """Ask where to save and write the HTML report of the shown (saved) run."""
+        run_id = self._last_run_id
+        if run_id is None or self.is_running:
+            return
+        default = Path(self._last_dir or ".") / report_filename(self._last_serial, run_id)
+        path, _ = QFileDialog.getSaveFileName(self, "Export report", str(default), "HTML report (*.html)")
+        if path:
+            self.export_report_to(run_id, path if Path(path).suffix else path + ".html")
+
+    def export_report_to(self, run_id: int, path: str | Path) -> bool:
+        """Write the HTML report of ``run_id`` to ``path``; return False after showing the error."""
+        try:
+            conn = db.init_db(self._db_path)
+            try:
+                report.export_html(conn, run_id, path)
+            finally:
+                conn.close()
+        except (report.RunNotFoundError, sqlite3.Error, OSError, ValueError, KeyError) as exc:
+            logger.exception("could not write report for run %s", run_id)
+            self.show_message(f"Report NOT written: {exc}", error=True)
+            return False
+        self._last_dir = str(Path(path).parent)
+        self.show_message(f"Report written: {path}")
+        return True
 
     # -- results and overlays --
 

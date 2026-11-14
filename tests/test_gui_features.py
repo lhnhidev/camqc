@@ -13,6 +13,7 @@ import pytest
 
 pytest.importorskip("PySide6")
 
+from gui_support import click, png, wait_for  # noqa: E402
 from PySide6.QtCore import Qt, QTimer  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication, QFileDialog  # noqa: E402
@@ -20,7 +21,6 @@ from PySide6.QtWidgets import QApplication, QFileDialog  # noqa: E402
 from camqc import db  # noqa: E402
 from camqc.gui import viewer, workers  # noqa: E402
 from camqc.gui.main_window import MainWindow, TestTab  # noqa: E402
-from gui_support import click, png, wait_for  # noqa: E402
 
 CONFIG = """
 models:
@@ -480,3 +480,162 @@ def test_a_folder_batch_causes_few_reloads_of_the_visible_tabs(
     wait_for(lambda: tab.folder_button.isEnabled() and not tab.is_running)
     wait_for(lambda: window.stats_tab.days != [] and window.stats_tab.days[0]["total"] == 3)
     assert 1 <= len(reloads) <= 2  # 3 saved images, but the reloads were coalesced
+
+
+# --- Export report -----------------------------------------------------------------------
+
+
+def stub_save_dialog(monkeypatch: pytest.MonkeyPatch, answer: str) -> dict[str, str]:
+    """Replace QFileDialog.getSaveFileName; returns what the dialog was asked."""
+    asked: dict[str, str] = {}
+
+    def fake(parent: object, caption: str, directory: str, file_filter: str) -> tuple[str, str]:
+        asked.update(caption=caption, directory=directory, file_filter=file_filter)
+        return answer, ""
+
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", fake)
+    return asked
+
+
+def saved_images(paths: dict[str, Path], run_id: int) -> dict[str, np.ndarray]:
+    conn = db.init_db(paths["db"])
+    try:
+        return db.get_run_images(conn, run_id)
+    finally:
+        conn.close()
+
+
+def test_report_filename_is_safe_and_descriptive() -> None:
+    from camqc.gui.main_window import report_filename
+
+    assert report_filename("SN-001", 7) == "report_SN-001_run7.html"
+    assert report_filename("a/b c:d", 3) == "report_a_b_c_d_run3.html"
+    assert report_filename("   ", 4) == "report_unit_run4.html"
+
+
+def test_export_button_is_enabled_only_for_a_saved_run(window: MainWindow, paths: dict[str, Path]) -> None:
+    tab = window.test_tab
+    assert tab.export_button.text() == "Export report" and not tab.export_button.isEnabled()
+    tab.set_frame("normal", paths["good"])
+    run_model(window, "M", "S1")
+    assert tab.export_button.isEnabled()
+    tab.set_frame("normal", paths["good"])
+    tab.serial_edit.setText("S2")
+    tab.model_combo.setCurrentText("M")
+    click(tab.run_button)
+    assert tab.is_running and not tab.export_button.isEnabled()  # a new run is under way: nothing to export yet
+    wait_for(lambda: tab.run_button.isEnabled() and not tab.is_running)
+    assert tab.export_button.isEnabled()
+
+
+def test_a_gui_run_stores_its_input_images(window: MainWindow, paths: dict[str, Path]) -> None:
+    window.test_tab.set_frame("normal", paths["good"])
+    run_model(window, "M", "S1")
+    assert set(saved_images(paths, 1)) == {"normal"}
+
+
+def test_export_writes_a_report_with_the_serial_and_the_image(
+    window: MainWindow, paths: dict[str, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tab = window.test_tab
+    tab.set_frame("normal", paths["good"])
+    run_model(window, "M", "SN-GUI-1")
+    out = tmp_path / "out" / "mine.html"
+    asked = stub_save_dialog(monkeypatch, str(out))
+    click(tab.export_button)
+    assert asked["caption"] == "Export report" and asked["directory"].endswith("report_SN-GUI-1_run1.html")
+    assert "HTML" in asked["file_filter"]
+    text = out.read_text(encoding="utf-8")
+    assert "SN-GUI-1" in text and "<td>brightness</td>" in text and "data:image/jpeg;base64," in text
+    assert f"Report written: {out}" in tab.message_label.text() and "#c00000" not in tab.message_label.styleSheet()
+
+
+def test_export_adds_the_html_extension_and_ignores_a_cancelled_dialog(
+    window: MainWindow, paths: dict[str, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tab = window.test_tab
+    tab.set_frame("normal", paths["good"])
+    run_model(window, "M", "SN-GUI-2")
+    stub_save_dialog(monkeypatch, "")  # the user cancels
+    message = tab.message_label.text()
+    click(tab.export_button)
+    assert tab.message_label.text() == message and not list(tmp_path.glob("**/*.html"))
+    stub_save_dialog(monkeypatch, str(tmp_path / "noext"))
+    click(tab.export_button)
+    assert "SN-GUI-2" in (tmp_path / "noext.html").read_text(encoding="utf-8")
+
+
+def test_export_failure_is_shown_not_raised(window: MainWindow, paths: dict[str, Path], tmp_path: Path) -> None:
+    tab = window.test_tab
+    tab.set_frame("normal", paths["good"])
+    run_model(window, "M", "S1")
+    assert not tab.export_report_to(1, tmp_path)  # a directory cannot be written as a file
+    assert "Report NOT written" in tab.message_label.text() and "#c00000" in tab.message_label.styleSheet()
+    assert not tab.export_report_to(999, tmp_path / "x.html")
+    assert "run #999 not found" in tab.message_label.text()
+
+
+def test_nothing_to_export_if_the_run_could_not_be_saved(qapp: QApplication, paths: dict[str, Path], tmp_path: Path) -> None:
+    win = MainWindow(paths["config"], tmp_path)  # a directory cannot be opened as a database
+    win.show()
+    win.test_tab.set_frame("normal", paths["good"])
+    run_model(win, "M", "S1")
+    assert "Result NOT saved" in win.test_tab.message_label.text()
+    assert not win.test_tab.export_button.isEnabled()
+    win.close()
+
+
+def test_after_a_folder_batch_the_report_is_for_the_last_saved_image(
+    window: MainWindow, paths: dict[str, Path], folder: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tab = start_folder(window, folder, monkeypatch)  # S001, S002, S003 saved; bad.png fails to load
+    wait_for(lambda: tab.folder_button.isEnabled() and not tab.is_running)
+    assert tab.export_button.isEnabled()
+    out = tmp_path / "last.html"
+    stub_save_dialog(monkeypatch, str(out))
+    click(tab.export_button)
+    text = out.read_text(encoding="utf-8")
+    assert "S003" in text and "S001" not in text and "data:image/jpeg;base64," in text
+
+
+def test_a_failed_pipeline_does_not_leave_the_previous_report_exportable(
+    window: MainWindow, paths: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tab = window.test_tab
+    tab.set_frame("normal", paths["good"])
+    run_model(window, "M", "S1")
+    assert tab.export_button.isEnabled()
+    monkeypatch.setattr(workers, "run_pipeline", lambda *a: (_ for _ in ()).throw(RuntimeError("boom")))
+    tab.set_frame("normal", paths["good"])
+    run_model(window, "M", "S2")
+    assert tab.verdict_label.text() == "ERROR" and tab._last_run_id is None
+    assert not tab.export_button.isEnabled()  # it would have exported S1 while the screen shows an error
+
+
+def test_starting_a_folder_batch_clears_the_exportable_run(
+    window: MainWindow, paths: dict[str, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tab = window.test_tab
+    tab.set_frame("normal", paths["good"])
+    run_model(window, "M", "S1")
+    assert tab._last_run_id == 1
+    only_bad = tmp_path / "bad_only"
+    only_bad.mkdir()
+    (only_bad / "x.png").write_bytes(b"garbage")  # every image of the batch fails to load
+    start_folder(window, only_bad, monkeypatch)
+    wait_for(lambda: tab.folder_button.isEnabled() and not tab.is_running)
+    assert tab._last_run_id is None and not tab.export_button.isEnabled()
+
+
+def test_unexpected_report_errors_are_shown_not_raised(
+    window: MainWindow, paths: dict[str, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tab = window.test_tab
+    tab.set_frame("normal", paths["good"])
+    run_model(window, "M", "S1")
+    from camqc import report
+
+    for error in (ValueError("cannot encode the image"), KeyError("x")):
+        monkeypatch.setattr(report, "export_html", lambda *a, _e=error: (_ for _ in ()).throw(_e))
+        assert not tab.export_report_to(1, tmp_path / "x.html")
+        assert "Report NOT written" in tab.message_label.text()
