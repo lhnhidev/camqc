@@ -2,50 +2,25 @@
 
 from __future__ import annotations
 
-import importlib.util
-from pathlib import Path
-from types import ModuleType
+from collections.abc import Callable
 
 import numpy as np
 import pytest
 
 from camqc.checks import shading
 
-TOOL_PATH = Path(__file__).resolve().parent.parent / "tools" / "gen_samples.py"
-SIZE = (1080, 1920)
 PARAMS = {"min_corner_pct": 80}
 
 
-def _load_tool() -> ModuleType:
-    spec = importlib.util.spec_from_file_location("gen_samples", TOOL_PATH)
-    assert spec and spec.loader
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-@pytest.fixture(scope="module")
-def sample() -> dict[str, np.ndarray]:
-    """Generate good_flat and strong_vignette in memory with the tool's own seeds."""
-    gs = _load_tool()
-    names = list(gs.SAMPLES)
-
-    def make(name: str) -> np.ndarray:
-        rng = np.random.default_rng([42, names.index(name)])
-        return gs.SAMPLES[name][0](rng, SIZE)
-
-    return {n: make(n) for n in ("good_flat.png", "strong_vignette.png")}
-
-
-def test_good_flat_passes(sample: dict[str, np.ndarray]) -> None:
-    result = shading.run(sample["good_flat.png"], PARAMS)
+def test_good_flat_passes(make_sample: Callable[[str], np.ndarray]) -> None:
+    result = shading.run(make_sample("good_flat.png"), PARAMS)
     assert result.passed and "reason" not in result.details
     assert 85 < result.value < 100
     assert result.name == "shading" and result.unit == "%" and result.low == 80
 
 
-def test_strong_vignette_fails(sample: dict[str, np.ndarray]) -> None:
-    result = shading.run(sample["strong_vignette.png"], PARAMS)
+def test_strong_vignette_fails(make_sample: Callable[[str], np.ndarray]) -> None:
+    result = shading.run(make_sample("strong_vignette.png"), PARAMS)
     assert not result.passed
     assert result.value < 80
     assert "below 80" in result.details["reason"]

@@ -2,64 +2,40 @@
 
 from __future__ import annotations
 
-import importlib.util
-from pathlib import Path
+from collections.abc import Callable
 
 import numpy as np
 import pytest
 
 from camqc.checks import pixels
 
-TOOL_PATH = Path(__file__).resolve().parent.parent / "tools" / "gen_samples.py"
-SIZE = (1080, 1920)
 HOT = {"mode": "hot", "diff_threshold": 50, "max_defects": 20}
 DEAD = {"mode": "dead", "diff_threshold": 50, "max_defects": 5}
 
 
-def _load_tool():  # noqa: ANN202
-    spec = importlib.util.spec_from_file_location("gen_samples", TOOL_PATH)
-    assert spec and spec.loader
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-@pytest.fixture(scope="module")
-def sample() -> dict[str, np.ndarray]:
-    """Generate the three pixel-test frames in memory, using the same seeds as the tool."""
-    gs = _load_tool()
-    names = list(gs.SAMPLES)
-
-    def make(name: str) -> np.ndarray:
-        rng = np.random.default_rng([42, names.index(name)])
-        return gs.SAMPLES[name][0](rng, SIZE)
-
-    return {n: make(n) for n in ("dark_good.png", "dark_bad.png", "white_bad.png")}
-
-
-def test_dark_bad_finds_about_15_hot_pixels(sample: dict[str, np.ndarray]) -> None:
-    result = pixels.run(sample["dark_bad.png"], {**HOT, "max_defects": 5})
+def test_dark_bad_finds_about_15_hot_pixels(make_sample: Callable[[str], np.ndarray]) -> None:
+    result = pixels.run(make_sample("dark_bad.png"), {**HOT, "max_defects": 5})
     assert 13 <= result.value <= 17
     assert not result.passed and "hot" in result.details["reason"]
     assert result.details["count"] == result.value == len(result.details["defects"])
     assert result.unit == "count" and result.high == 5
 
 
-def test_dark_good_passes(sample: dict[str, np.ndarray]) -> None:
-    result = pixels.run(sample["dark_good.png"], HOT)
+def test_dark_good_passes(make_sample: Callable[[str], np.ndarray]) -> None:
+    result = pixels.run(make_sample("dark_good.png"), HOT)
     assert result.passed and result.value == 0
     assert result.overlay == [] and "reason" not in result.details
 
 
-def test_white_bad_fails_in_dead_mode(sample: dict[str, np.ndarray]) -> None:
-    result = pixels.run(sample["white_bad.png"], DEAD)
+def test_white_bad_fails_in_dead_mode(make_sample: Callable[[str], np.ndarray]) -> None:
+    result = pixels.run(make_sample("white_bad.png"), DEAD)
     assert not result.passed
     assert 10 <= result.value <= 12  # 12 injected, adjacent ones may merge
 
 
-def test_mode_selects_direction(sample: dict[str, np.ndarray]) -> None:
-    assert pixels.run(sample["dark_bad.png"], {**DEAD, "max_defects": 0}).value == 0
-    assert pixels.run(sample["white_bad.png"], {**HOT, "max_defects": 0}).value == 0
+def test_mode_selects_direction(make_sample: Callable[[str], np.ndarray]) -> None:
+    assert pixels.run(make_sample("dark_bad.png"), {**DEAD, "max_defects": 0}).value == 0
+    assert pixels.run(make_sample("white_bad.png"), {**HOT, "max_defects": 0}).value == 0
 
 
 def test_coordinates_and_overlay() -> None:

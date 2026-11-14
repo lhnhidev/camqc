@@ -191,17 +191,25 @@ def build_manifest() -> dict[str, str]:
     return {name: defect for name, (_, defect) in SAMPLES.items()}
 
 
+def gen_sample(name: str, seed: int = 42, size: Size = (HEIGHT, WIDTH)) -> np.ndarray:
+    """Return the image for sample ``name`` exactly as :func:`generate_all` writes it.
+
+    Each image gets its own RNG derived from ``seed`` and the sample's index, so one
+    image's output does not depend on which others are generated.
+    """
+    idx = list(SAMPLES).index(name)
+    return SAMPLES[name][0](np.random.default_rng([seed, idx]), size)
+
+
 def generate_all(out_dir: Path, seed: int, size: Size = (HEIGHT, WIDTH)) -> dict[str, str]:
     """Write every sample PNG and ``manifest.json`` into ``out_dir``; return the manifest.
 
-    Each image gets its own RNG derived from ``seed`` and its index, so one image's output
-    does not depend on which others are generated.
+    Images are produced by :func:`gen_sample`.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
-    for idx, (name, (gen, _)) in enumerate(SAMPLES.items()):
-        rng = np.random.default_rng([seed, idx])
+    for name in SAMPLES:
         path = out_dir / name
-        if not cv2.imwrite(str(path), gen(rng, size)):
+        if not cv2.imwrite(str(path), gen_sample(name, seed, size)):
             raise OSError(f"failed to write {path}")
         logger.info("wrote %s", path)
     manifest = build_manifest()
